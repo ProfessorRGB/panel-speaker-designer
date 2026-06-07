@@ -82,4 +82,4 @@ FEA phases will use a Python sidecar process, keeping the same interface.
 
 ## Reference
 
-The physics and design rationale behind this tool are documented in [`panel-speaker-lesson.html`](../panel-speaker-lesson.html).
+The physics and design rationale behind this tool are documented in [`docs/panel-speaker-lesson.html`](docs/panel-speaker-lesson.html).
