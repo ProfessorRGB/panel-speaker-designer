@@ -1,8 +1,8 @@
 # Panel Speaker Designer
 
-A native macOS app for calculating the optimal transducer position on a rectangular flat-panel (DML) speaker.
+A native desktop app for calculating the optimal transducer position on a rectangular flat-panel (DML) speaker.
 
-Built with [Tauri 2](https://tauri.app) — Rust backend, TypeScript/Canvas frontend, ships as a native `.app`.
+Built with [Tauri 2](https://tauri.app) — Rust backend, TypeScript/Canvas frontend. Builds natively on macOS, Windows, and Linux.
 
 ---
 
@@ -46,9 +46,9 @@ The placement score at a point is the sum of `|mode_shape(x,y)|` across all mode
 
 ## Requirements
 
-- macOS 11+
 - [Rust](https://rustup.rs) (stable)
 - Node.js 18+
+- macOS 11+, Windows 10+, or a modern Linux desktop
 
 ---
 
