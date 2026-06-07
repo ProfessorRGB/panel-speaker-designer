@@ -1,0 +1,23 @@
+# Rust / Cargo
+target/
+
+# Node / Vite
+node_modules/
+dist/
+
+# Tauri build outputs
+src-tauri/target/
+src-tauri/gen/
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Editor
+.vscode/
+.idea/
+
+# Logs
+*.log
+npm-debug.log*
+.claude/

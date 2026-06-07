@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Panel Speaker Designer</title>
+  <link rel="stylesheet" href="/src/styles.css"/>
+  <script type="module" src="/src/main.ts" defer></script>
+</head>
+<body>
+  <div id="app">
+
+    <!-- ── Left sidebar ───────────────────────────────── -->
+    <aside class="sidebar">
+
+      <div class="sidebar-header">
+        <span class="app-name">Panel Designer</span>
+        <span class="version">v0.1</span>
+      </div>
+
+      <!-- Geometry -->
+      <section class="input-section">
+        <div class="section-label">Geometry</div>
+        <div class="field">
+          <label for="lx">Width</label>
+          <div class="input-with-unit">
+            <input type="number" id="lx" value="300" min="10" max="3000" step="1"/>
+            <span class="unit">mm</span>
+          </div>
+        </div>
+        <div class="field">
+          <label for="ly">Height</label>
+          <div class="input-with-unit">
+            <input type="number" id="ly" value="200" min="10" max="3000" step="1"/>
+            <span class="unit">mm</span>
+          </div>
+        </div>
+        <div class="field">
+          <label for="h">Thickness</label>
+          <div class="input-with-unit">
+            <input type="number" id="h" value="3" min="0.1" max="100" step="0.1"/>
+            <span class="unit">mm</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- Material -->
+      <section class="input-section">
+        <div class="section-label">Material</div>
+        <div class="field full-width">
+          <select id="material-preset">
+            <option value="xps">XPS Foam</option>
+            <option value="eps">EPS Foam</option>
+            <option value="balsa">Balsa Wood</option>
+            <option value="birch">Birch Plywood</option>
+            <option value="acrylic" selected>Acrylic (PMMA)</option>
+            <option value="aluminum">Aluminum</option>
+            <option value="carbon">Carbon Fibre (est.)</option>
+            <option value="custom">Custom…</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="e">Young's mod.</label>
+          <div class="input-with-unit">
+            <input type="number" id="e" value="3200" min="0.1" max="500000" step="1"/>
+            <span class="unit">MPa</span>
+          </div>
+        </div>
+        <div class="field">
+          <label for="rho">Density</label>
+          <div class="input-with-unit">
+            <input type="number" id="rho" value="1190" min="1" max="20000" step="1"/>
+            <span class="unit">kg/m³</span>
+          </div>
+        </div>
+        <div class="field">
+          <label for="nu">Poisson's ν</label>
+          <input type="number" id="nu" value="0.37" min="0.01" max="0.49" step="0.01"/>
+        </div>
+      </section>
+
+      <!-- Analysis -->
+      <section class="input-section">
+        <div class="section-label">Analysis</div>
+        <div class="field full-width">
+          <label for="boundary">Boundary</label>
+          <select id="boundary">
+            <option value="free" selected>Free edges (DML)</option>
+            <option value="simply_supported">Simply supported</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="freq-max">Max freq.</label>
+          <div class="input-with-unit">
+            <input type="number" id="freq-max" value="5000" min="100" max="40000" step="100"/>
+            <span class="unit">Hz</span>
+          </div>
+        </div>
+        <div class="field">
+          <label for="grid-n">Grid res.</label>
+          <div class="input-with-unit">
+            <input type="number" id="grid-n" value="100" min="20" max="100" step="10"/>
+            <span class="unit">pts</span>
+          </div>
+        </div>
+      </section>
+
+    </aside>
+
+    <!-- ── Main workspace ─────────────────────────────── -->
+    <main class="workspace">
+
+      <!-- Canvas toolbar -->
+      <div class="canvas-toolbar">
+        <div class="toolbar-left">
+          <span class="toolbar-label">Placement score</span>
+          <span id="mode-count-badge" class="badge"></span>
+        </div>
+        <div class="toolbar-right">
+          <label class="toolbar-item">
+            <span>Mode overlay</span>
+            <select id="mode-select">
+              <option value="-1">None</option>
+            </select>
+          </label>
+        </div>
+      </div>
+
+      <!-- Canvas -->
+      <div class="canvas-wrap" id="canvas-wrap">
+        <canvas id="heatmap"></canvas>
+        <div id="hover-tooltip" class="hover-tooltip"></div>
+      </div>
+
+      <!-- Result info bar -->
+      <div class="info-bar">
+        <div class="info-block" id="info-optimal">
+          <span class="info-label">Optimal position</span>
+          <span class="info-value" id="val-optimal">—</span>
+        </div>
+        <div class="info-block" id="info-cursor">
+          <span class="info-label">Cursor</span>
+          <span class="info-value" id="val-cursor">—</span>
+        </div>
+        <div class="info-block">
+          <span class="info-label">Modes used</span>
+          <span class="info-value" id="val-modes">—</span>
+        </div>
+        <div class="info-block">
+          <span class="info-label">f₁ (lowest)</span>
+          <span class="info-value" id="val-f1">—</span>
+        </div>
+        <div class="info-block status-block" id="status-block">
+          <span id="status-text">Calculating…</span>
+        </div>
+      </div>
+
+    </main>
+
+  </div>
+</body>
+</html>
