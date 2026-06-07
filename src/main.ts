@@ -46,7 +46,6 @@ const MATERIALS: Record<string, { e: number; rho: number; nu: number }> = {
 
 let lastResult: CalculationResult | null = null;
 let selectedModeIdx = -1;
-let calcPending = false;
 let calcTimer: ReturnType<typeof setTimeout> | null = null;
 
 // ── DOM refs ─────────────────────────────────────────────────────────────────
@@ -132,7 +131,6 @@ function render() {
   const ctx = canvas.getContext("2d")!;
   ctx.clearRect(0, 0, cw, ch);
 
-  const margin = 24;
   const pw = Math.round(lxMm * scale);   // panel pixel width
   const ph = Math.round(lyMm * scale);   // panel pixel height
   const ox = Math.round((cw - pw) / 2);  // panel offset x
@@ -252,30 +250,6 @@ function drawNodeLines(
   ctx.restore();
 }
 
-function drawLegend(
-  ctx: CanvasRenderingContext2D,
-  x: number, y: number,
-  w: number, h: number,
-) {
-  const steps = 120;
-  const stepH = h / steps;
-  for (let i = 0; i < steps; i++) {
-    const t = 1 - i / steps;  // top = high score (red), bottom = low (blue)
-    const [r, g, b] = sampleColormap(t);
-    ctx.fillStyle = `rgb(${r},${g},${b})`;
-    ctx.fillRect(x, y + i * stepH, w, Math.ceil(stepH));
-  }
-  ctx.strokeStyle = "rgba(255,255,255,0.25)";
-  ctx.lineWidth = 0.5;
-  ctx.strokeRect(x, y, w, h);
-
-  ctx.fillStyle = "rgba(180,180,180,0.7)";
-  ctx.font = "9px monospace";
-  ctx.textAlign = "left";
-  ctx.fillText("high", x + w + 3, y + 9);
-  ctx.fillText("low",  x + w + 3, y + h);
-}
-
 // ── Calculation ───────────────────────────────────────────────────────────────
 
 function getParams(): PanelParams {
@@ -298,7 +272,6 @@ function setStatus(state: "calculating" | "done" | "error", msg: string) {
 }
 
 async function calculate() {
-  calcPending = false;
   setStatus("calculating", "Calculating…");
 
   const params = getParams();
@@ -406,7 +379,7 @@ canvas.addEventListener("mousemove", (e) => {
   }
 
   const { normX, normY, x, y } = pos;
-  const { grid, grid_n, optimal_score_raw } = lastResult;
+  const { grid, grid_n } = lastResult;
   const col = Math.min(Math.floor(normX * grid_n), grid_n - 1);
   const row = Math.min(Math.floor(normY * grid_n), grid_n - 1);
   const normScore = grid[row * grid_n + col];
