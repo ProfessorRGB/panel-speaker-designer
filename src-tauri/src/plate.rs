@@ -45,6 +45,11 @@ impl Plate {
         if vals.iter().any(|v| !v.is_finite() || *v <= 0.0) {
             return Err("All dimensions and material constants must be positive".into());
         }
+        // Thin-plate theory needs the panel to be much larger than it is
+        // thick (this also catches half-typed dimensions).
+        if self.lx.min(self.ly) < 10.0 * self.h {
+            return Err("Panel is too small for its thickness: width and height must be at least 10× the thickness".into());
+        }
         // Positive-definite stiffness requires ν_xy·ν_yx < 1
         if !self.nu_xy.is_finite() || self.nu_xy < 0.0 || self.nu_xy * self.nu_xy * self.ey / self.ex >= 1.0 {
             return Err("Poisson's ratio is out of range for these moduli".into());

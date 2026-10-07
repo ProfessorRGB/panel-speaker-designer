@@ -5,7 +5,7 @@ mod model;
 mod plate;
 mod response;
 
-use geometry::{Cutout, Panel, Pt};
+use geometry::{Cutout, Panel, Pt, Stiffener};
 use model::{Discretisation, Model, ModelKey};
 use nalgebra::DMatrix;
 use plate::{Boundary, Plate};
@@ -21,6 +21,8 @@ pub struct PanelParams {
     pub sides: usize,     // polygon side count
     #[serde(default)]
     pub cutouts: Vec<Cutout>,  // holes and slots, positions in metres
+    #[serde(default)]
+    pub stiffeners: Vec<Stiffener>,  // bonded ribs, metres / Pa / kg/m³
     pub lx: f64,          // panel width  [m]
     pub ly: f64,          // panel height [m]
     pub h: f64,           // thickness    [m]
@@ -108,7 +110,14 @@ impl PanelParams {
         };
         // Resolve modes somewhat above freq_max, so the response near the top
         // of the band includes the tails of the modes just beyond it.
-        Ok(ModelKey::for_freq(plate, boundary, panel, self.cutouts.clone(), self.freq_max * RESPONSE_HEADROOM))
+        Ok(ModelKey::for_freq(
+            plate,
+            boundary,
+            panel,
+            self.cutouts.clone(),
+            self.stiffeners.clone(),
+            self.freq_max * RESPONSE_HEADROOM,
+        ))
     }
 
     /// Minimum distances from the outer edge and from cutout edges for a
@@ -448,4 +457,37 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![compute_heatmap, mode_shape, response_at])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn params() -> PanelParams {
+        PanelParams {
+            shape: "ellipse".into(), corner_r: 0.0, sides: 6, cutouts: vec![], stiffeners: vec![],
+            lx: 0.3, ly: 0.2, h: 0.003, ex: 3.2e9, ey: 3.2e9, g: 3.2e9 / 2.74, nu: 0.37, rho: 1190.0,
+            boundary: "free".into(), freq_max: 5000.0, grid_n: 60, exciter_d: 0.025, eta: 0.04, score: "flatness".into(),
+        }
+    }
+
+    // Regression: a half-typed width (4 mm) once sent the FEA eigen-solver
+    // after every mode up to the mesh's resolution limit and never returned.
+    #[test]
+    fn half_typed_dimensions_fail_fast() {
+        let t = std::time::Instant::now();
+        let err = compute_heatmap(PanelParams { lx: 0.004, ..params() }).err().unwrap();
+        assert!(err.contains("too small"), "{err}");
+        assert!(t.elapsed().as_millis() < 100);
+    }
+
+    // Regression: a mesh finer than the frequency needs must still only
+    // solve for modes up to the requested frequency.
+    #[test]
+    fn small_panels_solve_only_requested_modes() {
+        let t = std::time::Instant::now();
+        let r = compute_heatmap(PanelParams { lx: 0.045, ..params() }).unwrap();
+        assert!(r.mode_count > 0 && r.modes.iter().all(|m| m.freq <= 5000.0));
+        assert!(t.elapsed().as_secs_f64() < 2.0, "{:?}", t.elapsed());
+    }
 }

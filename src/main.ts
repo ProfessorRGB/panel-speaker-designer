@@ -8,11 +8,19 @@ type Cutout =
   | { kind: "hole"; x: number; y: number; d: number }
   | { kind: "slot"; x: number; y: number; length: number; width: number; angle: number };
 
+// Stiffener as sent to Rust: metres, Pa, kg/m³.
+interface StiffenerParams {
+  x1: number; y1: number; x2: number; y2: number;
+  width: number; height: number;
+  e: number; g: number; rho: number;
+}
+
 interface PanelParams {
   shape: string;
   corner_r: number;
   sides: number;
   cutouts: Cutout[];
+  stiffeners: StiffenerParams[];
   lx: number;
   ly: number;
   h: number;
@@ -102,6 +110,22 @@ let probe: Probe | null = null;
 
 // Cutouts as edited in the sidebar, in mm (angle in degrees).
 let cutouts: Cutout[] = [];
+
+// Rib materials: moduli in MPa along the rib, density in kg/m³.
+const RIB_MATERIALS: Record<string, { label: string; e: number; g: number; rho: number }> = {
+  spruce:   { label: "Spruce",           e: 10000,  g: 620,   rho: 450 },
+  carbon:   { label: "Carbon fibre bar", e: 130000, g: 5000,  rho: 1550 },
+  aluminum: { label: "Aluminium",        e: 69000,  g: 26000, rho: 2700 },
+  panel:    { label: "Same as panel",    e: 0,      g: 0,     rho: 0 },
+};
+
+// Stiffeners as edited in the sidebar, in mm.
+interface Stiffener {
+  x1: number; y1: number; x2: number; y2: number;
+  width: number; height: number;
+  material: keyof typeof RIB_MATERIALS;
+}
+let stiffeners: Stiffener[] = [];
 
 // ── DOM refs ─────────────────────────────────────────────────────────────────
 
@@ -252,6 +276,25 @@ function render() {
   ctx.lineWidth = 1;
   ctx.stroke(outlinePath);
 
+  // ── Stiffeners ────────────────────────────────────────────────────────────
+  ctx.save();
+  ctx.lineCap = "round";
+  for (const s of stiffeners) {
+    const ax = ox + (s.x1 / lxMm) * pw, ay = oy + (s.y1 / lyMm) * ph;
+    const bx = ox + (s.x2 / lxMm) * pw, by = oy + (s.y2 / lyMm) * ph;
+    const width = Math.max(3, s.width * scale);
+    ctx.beginPath();
+    ctx.moveTo(ax, ay);
+    ctx.lineTo(bx, by);
+    ctx.strokeStyle = "rgba(0,0,0,0.55)";
+    ctx.lineWidth = width + 2;
+    ctx.stroke();
+    ctx.strokeStyle = "rgba(240,228,200,0.9)";
+    ctx.lineWidth = width;
+    ctx.stroke();
+  }
+  ctx.restore();
+
   // ── Mode node lines ───────────────────────────────────────────────────────
   if (selectedShape) {
     drawNodeLines(ctx, selectedShape, SHAPE_GRID_N, ox, oy, pw, ph);
@@ -391,6 +434,7 @@ function getParams(): PanelParams {
     cutouts:   cutouts.map((c) => c.kind === "hole"
       ? { ...c, x: c.x / 1000, y: c.y / 1000, d: c.d / 1000 }
       : { ...c, x: c.x / 1000, y: c.y / 1000, length: c.length / 1000, width: c.width / 1000 }),
+    stiffeners: stiffeners.map(stiffenerParams),
     lx:        parseFloat(inputLx.value) / 1000,
     ly:        parseFloat(inputLy.value) / 1000,
     h:         parseFloat(inputH.value)  / 1000,
@@ -423,15 +467,42 @@ function syncIsotropic() {
   }
 }
 
-function setStatus(state: "calculating" | "done" | "error", msg: string) {
+function setStatus(state: "calculating" | "done" | "error" | "stale", msg: string) {
   statusText.className = state;
   statusText.textContent = msg;
 }
 
-async function calculate() {
-  const id = ++requestId;
-  setStatus("calculating", "Calculating…");
+// Edits bump editVersion; a solve records the version it used, so edits
+// made while it runs leave the result marked out of date.
+let editVersion = 0;
+const solveBtn   = $("solve-btn") as HTMLButtonElement;
+const autoSolve  = $("auto-solve") as HTMLInputElement;
 
+function markStale() {
+  solveBtn.classList.add("stale");
+  canvasWrap.classList.add("stale");
+  setStatus("stale", "Changed · press Solve");
+}
+
+async function calculate() {
+  if (calcTimer) clearTimeout(calcTimer);
+  const id = ++requestId;
+  const version = editVersion;
+  solveBtn.disabled = true;
+  solveBtn.classList.remove("stale");
+  canvasWrap.classList.remove("stale");
+  setStatus("calculating", "Solving…");
+  try {
+    await solve(id);
+  } finally {
+    if (id === requestId) {
+      solveBtn.disabled = false;
+      if (editVersion !== version) markStale();
+    }
+  }
+}
+
+async function solve(id: number) {
   const params = getParams();
 
   if (
@@ -538,10 +609,37 @@ function updateCharts() {
     : `${gaps} empty band${gaps === 1 ? "" : "s"}`;
 }
 
+/** Called on every settings change. Solves after a short pause with
+ *  Auto-solve on; otherwise marks the result out of date. */
 function scheduleCalculate() {
+  editVersion++;
   if (calcTimer) clearTimeout(calcTimer);
-  calcTimer = setTimeout(calculate, 250);
+  if (autoSolve.checked) {
+    calcTimer = setTimeout(calculate, 400);
+  } else if (!solveBtn.disabled) {
+    markStale();
+  }
 }
+
+solveBtn.addEventListener("click", () => calculate());
+
+// Enter in any sidebar field solves.
+document.querySelector(".sidebar")!.addEventListener("keydown", (e) => {
+  const ev = e as KeyboardEvent;
+  if (ev.key === "Enter" && (ev.target as HTMLElement).tagName === "INPUT") {
+    ev.preventDefault();
+    calculate();
+  }
+});
+
+// Remember the Auto-solve choice per viewer (storage may be unavailable).
+try {
+  autoSolve.checked = localStorage.getItem("autoSolve") === "1";
+} catch { /* default off */ }
+autoSolve.addEventListener("change", () => {
+  try { localStorage.setItem("autoSolve", autoSolve.checked ? "1" : "0"); } catch { /* ignore */ }
+  if (autoSolve.checked && solveBtn.classList.contains("stale")) calculate();
+});
 
 function updateUI(result: CalculationResult, params: PanelParams) {
   // Optimal position
@@ -698,6 +796,26 @@ function syncShapeFields() {
   $("field-sides").hidden = shape !== "polygon";
   $("shape-hint").hidden = shape === "rectangle";
 }
+/** A stiffener in SI units, with its material resolved. "Same as panel"
+ *  takes the panel's stiffness along the rib's direction. */
+function stiffenerParams(s: Stiffener): StiffenerParams {
+  let { e, g, rho } = RIB_MATERIALS[s.material];
+  if (s.material === "panel") {
+    const ex = parseFloat(inputEx.value), ey = parseFloat(inputEy.value);
+    const gp = parseFloat(inputG.value), nu = parseFloat(inputNu.value);
+    const a = Math.atan2(s.y2 - s.y1, s.x2 - s.x1);
+    const c2 = Math.cos(a) ** 2, s2 = Math.sin(a) ** 2;
+    e = 1 / (c2 * c2 / ex + s2 * s2 / ey + c2 * s2 * (1 / gp - 2 * nu / ex));
+    g = gp;
+    rho = parseFloat(inputRho.value);
+  }
+  return {
+    x1: s.x1 / 1000, y1: s.y1 / 1000, x2: s.x2 / 1000, y2: s.y2 / 1000,
+    width: s.width / 1000, height: s.height / 1000,
+    e: e * 1e6, g: g * 1e6, rho,
+  };
+}
+
 // ── Cutouts ──────────────────────────────────────────────────────────────────
 
 const cutoutList = $("cutout-list");
@@ -777,6 +895,99 @@ function addCutout(kind: Cutout["kind"]) {
 }
 
 $("add-hole").addEventListener("click", () => addCutout("hole"));
+
+// ── Stiffeners ───────────────────────────────────────────────────────────────
+
+const stiffenerList = $("stiffener-list");
+
+const STIFFENER_FIELDS: CutoutField[] = [
+  { key: "x1", label: "Start X", unit: "mm", step: 1 },
+  { key: "y1", label: "Start Y", unit: "mm", step: 1 },
+  { key: "x2", label: "End X", unit: "mm", step: 1 },
+  { key: "y2", label: "End Y", unit: "mm", step: 1 },
+  { key: "width", label: "Width", unit: "mm", step: 0.5 },
+  { key: "height", label: "Height", unit: "mm", step: 0.5 },
+];
+
+function renderStiffeners() {
+  stiffenerList.innerHTML = "";
+  stiffeners.forEach((s, i) => {
+    const card = document.createElement("div");
+    card.className = "cutout-card";
+    const header = document.createElement("header");
+    header.textContent = `Rib ${i + 1}`;
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.textContent = "×";
+    remove.title = "Remove this rib";
+    remove.addEventListener("click", () => {
+      stiffeners.splice(i, 1);
+      renderStiffeners();
+      render();
+      scheduleCalculate();
+    });
+    header.appendChild(remove);
+    card.appendChild(header);
+
+    for (const f of STIFFENER_FIELDS) {
+      const label = document.createElement("label");
+      label.textContent = f.label;
+      const wrap = document.createElement("div");
+      wrap.className = "input-with-unit";
+      const input = document.createElement("input");
+      input.type = "number";
+      input.step = String(f.step);
+      input.value = String((s as unknown as Record<string, number>)[f.key]);
+      input.addEventListener("input", () => {
+        const v = parseFloat(input.value);
+        if (!isNaN(v)) {
+          (s as unknown as Record<string, number>)[f.key] = v;
+          render();
+          scheduleCalculate();
+        }
+      });
+      const unit = document.createElement("span");
+      unit.className = "unit";
+      unit.textContent = f.unit;
+      wrap.append(input, unit);
+      label.appendChild(wrap);
+      card.appendChild(label);
+    }
+
+    const matLabel = document.createElement("label");
+    matLabel.className = "full";
+    matLabel.textContent = "Material";
+    const select = document.createElement("select");
+    for (const [key, m] of Object.entries(RIB_MATERIALS)) {
+      const opt = document.createElement("option");
+      opt.value = key;
+      opt.textContent = m.label;
+      select.appendChild(opt);
+    }
+    select.value = s.material;
+    select.addEventListener("change", () => {
+      s.material = select.value as Stiffener["material"];
+      scheduleCalculate();
+    });
+    matLabel.appendChild(select);
+    card.appendChild(matLabel);
+    stiffenerList.appendChild(card);
+  });
+}
+
+$("add-stiffener").addEventListener("click", () => {
+  const w = parseFloat(inputLx.value) || 300;
+  const h = parseFloat(inputLy.value) || 200;
+  // A bass-bar-like default: along the width, a little off-centre.
+  stiffeners.push({
+    x1: Math.round(w * 0.15), y1: Math.round(h * 0.35),
+    x2: Math.round(w * 0.85), y2: Math.round(h * 0.35),
+    width: 5, height: 8, material: "spruce",
+  });
+  renderStiffeners();
+  render();
+  scheduleCalculate();
+});
 $("add-slot").addEventListener("click", () => addCutout("slot"));
 
 selectShape.addEventListener("change", () => {

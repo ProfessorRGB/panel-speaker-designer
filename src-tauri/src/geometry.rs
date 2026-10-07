@@ -105,6 +105,27 @@ impl Cutout {
     }
 }
 
+/// A straight rib bonded to one face of the panel, from (x1, y1) to (x2, y2)
+/// in metres, with a `width` × `height` rectangular cross-section.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct Stiffener {
+    pub x1: f64,
+    pub y1: f64,
+    pub x2: f64,
+    pub y2: f64,
+    pub width: f64,
+    pub height: f64,
+    pub e: f64,    // Young's modulus along the rib [Pa]
+    pub g: f64,    // shear modulus [Pa]
+    pub rho: f64,  // density [kg/m³]
+}
+
+impl Stiffener {
+    pub fn start(&self) -> Pt { [self.x1, self.y1] }
+    pub fn end(&self) -> Pt { [self.x2, self.y2] }
+    pub fn length(&self) -> f64 { dist(self.start(), self.end()) }
+}
+
 /// Smallest gap allowed between a cutout and the panel edge or another
 /// cutout. Narrower ligaments can't be meshed sensibly.
 pub const MIN_GAP: f64 = 0.001;
@@ -146,6 +167,57 @@ impl Shape {
         }
         Ok(())
     }
+}
+
+impl Shape {
+    /// Checks that every stiffener is at least 2 mm long, lies inside the
+    /// panel material at least `MIN_GAP` from all edges (outer and cutouts),
+    /// and doesn't cross another stiffener.
+    pub fn validate_stiffeners(&self, stiffeners: &[Stiffener]) -> Result<(), String> {
+        let size = stiffeners.iter().map(|s| s.length()).fold(0.0, f64::max).max(1e-3);
+        let outline = Outline::new(self, size / 400.0);
+        for (i, s) in stiffeners.iter().enumerate() {
+            let label = format!("Stiffener {}", i + 1);
+            if s.length() < 0.002 {
+                return Err(format!("{label} is shorter than 2 mm"));
+            }
+            if [s.width, s.height, s.e, s.g, s.rho].iter().any(|v| !v.is_finite() || *v <= 0.0) {
+                return Err(format!("{label} needs a positive size and material values"));
+            }
+            let samples: Vec<Pt> = (0..=200)
+                .map(|k| {
+                    let t = k as f64 / 200.0;
+                    [s.x1 + t * (s.x2 - s.x1), s.y1 + t * (s.y2 - s.y1)]
+                })
+                .collect();
+            if samples.iter().any(|p| !outline.contains(*p)) {
+                return Err(format!("{label} runs off the panel or across a cutout"));
+            }
+            if samples.iter().any(|p| outline.distance_to_edge(*p) < MIN_GAP) {
+                return Err(format!("{label} is closer than 1 mm to an edge"));
+            }
+            for (j, o) in stiffeners.iter().enumerate().take(i) {
+                if segments_cross(s.start(), s.end(), o.start(), o.end()) {
+                    return Err(format!("{label} crosses stiffener {}", j + 1));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// True if two segments intersect or touch.
+fn segments_cross(a: Pt, b: Pt, c: Pt, d: Pt) -> bool {
+    let orient = |p: Pt, q: Pt, r: Pt| (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0]);
+    let on = |p: Pt, q: Pt, r: Pt| {
+        r[0] >= p[0].min(q[0]) - 1e-12 && r[0] <= p[0].max(q[0]) + 1e-12
+            && r[1] >= p[1].min(q[1]) - 1e-12 && r[1] <= p[1].max(q[1]) + 1e-12
+    };
+    let (d1, d2, d3, d4) = (orient(c, d, a), orient(c, d, b), orient(a, b, c), orient(a, b, d));
+    if ((d1 > 0.0 && d2 < 0.0) || (d1 < 0.0 && d2 > 0.0)) && ((d3 > 0.0 && d4 < 0.0) || (d3 < 0.0 && d4 > 0.0)) {
+        return true;
+    }
+    (d1 == 0.0 && on(c, d, a)) || (d2 == 0.0 && on(c, d, b)) || (d3 == 0.0 && on(a, b, c)) || (d4 == 0.0 && on(a, b, d))
 }
 
 /// Smallest distance between the vertices of one ring and the edges of another.
@@ -431,6 +503,20 @@ mod tests {
         // Ellipse: a hole in the bounding-box corner is off the panel.
         let c = vec![Cutout::Hole { x: 0.03, y: 0.03, d: 0.02 }];
         assert!(Panel::Ellipse.to_shape(0.3, 0.2, &c).validate(&c).is_err());
+    }
+
+    #[test]
+    fn stiffeners_are_validated() {
+        let rib = |x1: f64, y1: f64, x2: f64, y2: f64| Stiffener {
+            x1, y1, x2, y2, width: 0.005, height: 0.01, e: 10e9, g: 0.6e9, rho: 450.0,
+        };
+        let c = vec![Cutout::Hole { x: 0.15, y: 0.1, d: 0.04 }];
+        let shape = Panel::Rectangle.to_shape(0.3, 0.2, &c);
+        assert!(shape.validate_stiffeners(&[rib(0.02, 0.05, 0.28, 0.05)]).is_ok());
+        assert!(shape.validate_stiffeners(&[rib(0.0005, 0.05, 0.28, 0.05)]).unwrap_err().contains("closer than 1 mm"));
+        assert!(shape.validate_stiffeners(&[rib(0.02, 0.1, 0.28, 0.1)]).unwrap_err().contains("across a cutout"));
+        assert!(shape.validate_stiffeners(&[rib(0.02, 0.05, 0.28, 0.05), rib(0.05, 0.02, 0.05, 0.18)])
+            .unwrap_err().contains("crosses"));
     }
 
     #[test]

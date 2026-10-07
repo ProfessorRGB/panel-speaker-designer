@@ -373,6 +373,15 @@ select:focus {
   color: var(--sidebar-muted);
 }
 
+.cutout-card label.full {
+  grid-column: 1 / -1;
+}
+
+.cutout-card select {
+  font-size: 11px;
+  padding: 3px 6px;
+}
+
 .cutout-actions {
   display: flex;
   gap: 6px;
@@ -554,6 +563,42 @@ select:focus {
 
 #status-text.done {
   color: var(--accent-green);
+}
+
+/* Result no longer matches the settings. */
+.canvas-wrap.stale canvas {
+  opacity: 0.45;
+  transition: opacity 0.15s;
+}
+
+#status-text.stale {
+  color: #e0a030;
+}
+
+.solve-btn {
+  background: var(--accent);
+  border: none;
+  border-radius: var(--radius);
+  color: #fff;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 4px 14px;
+  cursor: pointer;
+}
+
+.solve-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* Out-of-date result: draw attention to Solve. */
+.solve-btn.stale {
+  box-shadow: 0 0 0 2px rgba(10,132,255,0.35);
+}
+
+.auto-solve input {
+  accent-color: var(--accent);
 }
 
 #status-text.error {

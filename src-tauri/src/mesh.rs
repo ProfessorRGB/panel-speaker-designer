@@ -22,7 +22,9 @@ impl Mesh {
 const MAX_NODES: usize = 40_000;
 
 /// Meshes `outline` with elements of roughly size `h` (edge length).
-pub fn mesh(outline: &Outline, h: f64) -> Result<Mesh, String> {
+/// `lines` are open polylines inside the panel (stiffeners) that the mesh
+/// must follow edge for edge.
+pub fn mesh(outline: &Outline, h: f64, lines: &[Vec<Pt>]) -> Result<Mesh, String> {
     let mut vertices = Vec::new();
     let mut edges = Vec::new();
     for ring in outline.rings() {
@@ -34,15 +36,34 @@ pub fn mesh(outline: &Outline, h: f64) -> Result<Mesh, String> {
             edges.push([base + i, base + (i + 1) % ring.len()]);
         }
     }
+    for line in lines {
+        let base = vertices.len();
+        for p in line {
+            vertices.push(Point2::new(p[0], p[1]));
+        }
+        for i in 1..line.len() {
+            edges.push([base + i - 1, base + i]);
+        }
+    }
 
-    let mut cdt = ConstrainedDelaunayTriangulation::<Point2<f64>>::bulk_load_cdt(vertices, edges)
+    // Crossing edges are rejected by geometry validation; this is a backstop
+    // so a missed case reports an error instead of panicking.
+    let mut conflict = false;
+    let mut cdt = ConstrainedDelaunayTriangulation::<Point2<f64>>::try_bulk_load_cdt(vertices, edges, |_| conflict = true)
         .map_err(|e| format!("Couldn't triangulate the outline: {e:?}"))?;
+    if conflict {
+        return Err("Edges of the outline, cutouts or stiffeners cross each other".into());
+    }
 
     // Equilateral triangle of side h.
     let max_area = 3f64.sqrt() / 4.0 * h * h;
+    // Spade decides inside/outside by crossing parity of constraint edges,
+    // which open stiffener lines would flip; with lines present, refine
+    // everything and classify triangles by their centroid instead.
+    let use_parity = lines.is_empty();
     let result = cdt.refine(
         RefinementParameters::<f64>::new()
-            .exclude_outer_faces(true)
+            .exclude_outer_faces(use_parity)
             .with_max_allowed_area(max_area)
             .with_angle_limit(AngleLimit::from_deg(25.0))
             .with_max_additional_vertices(MAX_NODES),
@@ -61,6 +82,12 @@ pub fn mesh(outline: &Outline, h: f64) -> Result<Mesh, String> {
             continue;
         }
         let vs = face.vertices();
+        if !use_parity {
+            let c = vs.iter().fold([0.0, 0.0], |a, v| [a[0] + v.position().x / 3.0, a[1] + v.position().y / 3.0]);
+            if !outline.contains(c) {
+                continue;
+            }
+        }
         let mut tri = [0usize; 3];
         for (k, v) in vs.iter().enumerate() {
             let id = v.fix().index();
@@ -94,14 +121,26 @@ mod tests {
         };
         let h = 0.01;
         let outline = Outline::new(&shape, h);
-        let m = mesh(&outline, h).unwrap();
+        let m = mesh(&outline, h, &[]).unwrap();
         let area: f64 = (0..m.tris.len()).map(|t| m.triangle_area(t)).sum();
         assert!((area - outline.area()).abs() / outline.area() < 1e-9, "{area} vs {}", outline.area());
         assert!((0..m.tris.len()).all(|t| m.triangle_area(t) > 0.0));
         // No triangle centroid inside the hole.
+        let check = |m: &Mesh| {
         for t in &m.tris {
             let c = t.iter().fold([0.0, 0.0], |a, &i| [a[0] + m.nodes[i][0] / 3.0, a[1] + m.nodes[i][1] / 3.0]);
             assert!(outline.contains(c));
         }
+        };
+        check(&m);
+
+        // With an interior line the mesh still covers the same area, and the
+        // line's points are mesh nodes.
+        let line = vec![[0.02, 0.18], [0.28, 0.18]];
+        let m = mesh(&outline, h, &[line]).unwrap();
+        let area: f64 = (0..m.tris.len()).map(|t| m.triangle_area(t)).sum();
+        assert!((area - outline.area()).abs() / outline.area() < 1e-9, "{area} vs {}", outline.area());
+        assert!(m.nodes.iter().any(|p| (p[0] - 0.02).abs() < 1e-12 && (p[1] - 0.18).abs() < 1e-12));
+        check(&m);
     }
 }

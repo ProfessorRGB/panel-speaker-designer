@@ -23,6 +23,64 @@ use faer::sparse::{SparseColMat, Triplet};
 use faer::{Accum, Mat, Par, Side};
 use std::f64::consts::PI;
 
+/// A stiffener as a chain of mesh nodes along a straight line, modelled as
+/// Euler-Bernoulli beam elements (bending along the rib) plus St Venant
+/// torsion, sharing the plate's nodal unknowns.
+pub struct Beam {
+    pub nodes: Vec<usize>,    // ordered along the rib
+    pub ei: f64,              // bending stiffness added to the panel [N·m²]
+    pub gj: f64,              // torsional stiffness [N·m²]
+    pub mass_per_len: f64,    // [kg/m]
+}
+
+/// Stiffness of one beam element between nodes at `a` and `b`, in the plate
+/// unknowns [w, ∂w/∂x, ∂w/∂y] of each node. Along the beam, the bending
+/// slope is the directional derivative of w and the twist is the slope
+/// across it.
+fn beam_stiffness(a: Pt, b: Pt, ei: f64, gj: f64) -> [[f64; 6]; 6] {
+    let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+    let len = dx.hypot(dy);
+    let (c, s) = (dx / len, dy / len);
+    // Local unknowns: [w1, θs1, θn1, w2, θs2, θn2].
+    let mut kl = [[0.0; 6]; 6];
+    let k = ei / len.powi(3);
+    let (l, l2) = (len, len * len);
+    let bend = [
+        [12.0, 6.0 * l, -12.0, 6.0 * l],
+        [6.0 * l, 4.0 * l2, -6.0 * l, 2.0 * l2],
+        [-12.0, -6.0 * l, 12.0, -6.0 * l],
+        [6.0 * l, 2.0 * l2, -6.0 * l, 4.0 * l2],
+    ];
+    let bidx = [0, 1, 3, 4];
+    for (r, &i) in bidx.iter().enumerate() {
+        for (q, &j) in bidx.iter().enumerate() {
+            kl[i][j] = k * bend[r][q];
+        }
+    }
+    let kt = gj / len;
+    kl[2][2] = kt;
+    kl[5][5] = kt;
+    kl[2][5] = -kt;
+    kl[5][2] = -kt;
+    // Local from plate unknowns: θs = c·∂w/∂x + s·∂w/∂y, θn = −s·∂w/∂x + c·∂w/∂y.
+    let mut t = [[0.0; 6]; 6];
+    for n in 0..2 {
+        let o = 3 * n;
+        t[o][o] = 1.0;
+        t[o + 1][o + 1] = c;
+        t[o + 1][o + 2] = s;
+        t[o + 2][o + 1] = -s;
+        t[o + 2][o + 2] = c;
+    }
+    let mut kg = [[0.0; 6]; 6];
+    for i in 0..6 {
+        for j in 0..6 {
+            kg[i][j] = (0..6).map(|p| (0..6).map(|q| t[p][i] * kl[p][q] * t[q][j]).sum::<f64>()).sum();
+        }
+    }
+    kg
+}
+
 pub struct FemMode {
     pub freq: f64,
     pub w: Vec<f64>,  // transverse displacement at each mesh node
@@ -118,6 +176,7 @@ pub fn solve(
     rho_h3_12: f64,
     freq_max: f64,
     pinned: &[usize],
+    beams: &[Beam],
 ) -> Result<Vec<FemMode>, String> {
     let nn = mesh.nodes.len();
     let n = 3 * nn;
@@ -136,6 +195,13 @@ pub fn solve(
         }
     }
     let total_area: f64 = node_area.iter().sum();
+    for beam in beams {
+        for pair in beam.nodes.windows(2) {
+            let half = beam.mass_per_len * crate::geometry::dist(mesh.nodes[pair[0]], mesh.nodes[pair[1]]) / 2.0;
+            mass[3 * pair[0]] += half;
+            mass[3 * pair[1]] += half;
+        }
+    }
 
     // Shift so that K + σM is positive definite despite the rigid-body modes.
     // σ near the expected fundamental keeps the shifted problem well scaled.
@@ -153,6 +219,20 @@ pub fn solve(
                 let (r, c) = (3 * tri[a / 3] + a % 3, 3 * tri[b / 3] + b % 3);
                 if r >= c {
                     triplets.push(Triplet::new(r, c, ke[a][b]));
+                }
+            }
+        }
+    }
+    for beam in beams {
+        for pair in beam.nodes.windows(2) {
+            let ke = beam_stiffness(mesh.nodes[pair[0]], mesh.nodes[pair[1]], beam.ei, beam.gj);
+            k_diag_max = (0..6).fold(k_diag_max, |a, q| a.max(ke[q][q]));
+            for a in 0..6 {
+                for b in 0..6 {
+                    let (r, c) = (3 * pair[a / 3] + a % 3, 3 * pair[b / 3] + b % 3);
+                    if r >= c {
+                        triplets.push(Triplet::new(r, c, ke[a][b]));
+                    }
                 }
             }
         }
@@ -230,6 +310,7 @@ fn block_lanczos(
     let n = mass.len();
     let nu_min = 1.0 / (lambda_max + sigma);
     let mut capacity = (2 * estimate + 8 * BLOCK).min(n);
+    let max_basis = (6 * estimate + 64 * BLOCK).min(n);
     let mut basis = Mat::<f64>::zeros(n, capacity);
     let mut used = 0;
     // Block tridiagonal projection: diagonal blocks A_j, sub-diagonal B_j.
@@ -248,8 +329,11 @@ fn block_lanczos(
 
     loop {
         if used + BLOCK > capacity {
-            if capacity + BLOCK > n {
-                return Err("Eigen solver did not converge".into());
+            // Convergence normally needs about twice the wanted count; far
+            // beyond that something is wrong, so stop rather than grow the
+            // basis toward the full problem size.
+            if capacity + BLOCK > n || capacity >= max_basis {
+                return Err("The eigen-solver didn't converge for this panel; try a lower max frequency".into());
             }
             // Grow the Krylov space.
             let new_cap = (capacity + capacity / 2).min(n);
@@ -419,8 +503,8 @@ mod tests {
 
     fn fem_modes(p: &Plate, path: Path, h: f64, freq_max: f64) -> Vec<FemMode> {
         let outline = Outline::new(&Shape { outline: path, holes: vec![] }, h);
-        let m = mesh::mesh(&outline, h).unwrap();
-        solve(&m, &p.rigidities(), p.rho * p.h, p.rho * p.h.powi(3) / 12.0, freq_max, &[]).unwrap()
+        let m = mesh::mesh(&outline, h, &[]).unwrap();
+        solve(&m, &p.rigidities(), p.rho * p.h, p.rho * p.h.powi(3) / 12.0, freq_max, &[], &[]).unwrap()
     }
 
     #[test]
@@ -451,9 +535,9 @@ mod tests {
         let p = acrylic(0.3, 0.2);
         let h = 0.006;
         let outline = Outline::new(&Shape { outline: Path::rectangle(0.0, 0.0, 0.3, 0.2), holes: vec![] }, h);
-        let m = mesh::mesh(&outline, h).unwrap();
+        let m = mesh::mesh(&outline, h, &[]).unwrap();
         let pinned: Vec<usize> = (0..m.nodes.len()).filter(|&i| outline.distance_to_edge(m.nodes[i]) < 1e-9).collect();
-        let fe = solve(&m, &p.rigidities(), p.rho * p.h, p.rho * p.h.powi(3) / 12.0, 1500.0, &pinned).unwrap();
+        let fe = solve(&m, &p.rigidities(), p.rho * p.h, p.rho * p.h.powi(3) / 12.0, 1500.0, &pinned, &[]).unwrap();
         let exact = plate::solve(SolveKey::for_freq(p, Boundary::SimplySupported, 2000.0));
         for (k, (a, b)) in fe.iter().zip(&exact.modes).enumerate() {
             let err = (a.freq - b.freq) / b.freq;

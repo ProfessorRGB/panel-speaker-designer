@@ -76,6 +76,16 @@
         <div class="field-hint">Positions are the cutout's centre, from the top-left corner. Slots cut the bending path across them, lowering those modes.</div>
       </section>
 
+      <!-- Stiffeners -->
+      <section class="input-section">
+        <div class="section-label">Stiffeners</div>
+        <div id="stiffener-list" class="cutout-list"></div>
+        <div class="cutout-actions">
+          <button type="button" id="add-stiffener">+ Rib</button>
+        </div>
+        <div class="field-hint">Straight ribs glued to one face, from one end point to the other. Height is the rib's depth off the panel. Stiffness is an approximation (rib plus a strip of panel acting as a T-beam).</div>
+      </section>
+
       <!-- Material -->
       <section class="input-section">
         <div class="section-label">Material</div>
@@ -182,6 +192,11 @@
       <!-- Canvas toolbar -->
       <div class="canvas-toolbar">
         <div class="toolbar-left">
+          <button type="button" id="solve-btn" class="solve-btn" title="Solve with the current settings (Enter in any field)">Solve</button>
+          <label class="toolbar-item auto-solve" title="Solve automatically after each change. Fine for rectangles; other shapes take a second or more per solve.">
+            <input type="checkbox" id="auto-solve"/>
+            <span>Auto</span>
+          </label>
           <span class="toolbar-label">Placement score</span>
           <span id="mode-count-badge" class="badge"></span>
         </div>

@@ -5,7 +5,7 @@
 // panel material evaluate to NaN.
 
 use crate::fem;
-use crate::geometry::{Cutout, Outline, Panel, Pt};
+use crate::geometry::{dist, Cutout, Outline, Panel, Pt, Stiffener};
 use crate::mesh::{self, Mesh};
 use crate::plate::{self, Boundary, GridBasis, Plate, PointBasis, SolveKey};
 use std::f64::consts::PI;
@@ -18,7 +18,9 @@ const MAX_FEA_NODES: f64 = 15_000.0;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Discretisation {
     Analytic(SolveKey),
-    Fea { h: f64 },
+    /// Element size `h`, solving for modes up to `freq` (or the mesh's own
+    /// resolution limit, if lower).
+    Fea { h: f64, freq: f64 },
 }
 
 /// Everything the modes depend on, so equal keys give identical results.
@@ -28,12 +30,20 @@ pub struct ModelKey {
     pub boundary: Boundary,
     pub panel: Panel,
     pub cutouts: Vec<Cutout>,
+    pub stiffeners: Vec<Stiffener>,
     pub disc: Discretisation,
 }
 
 impl ModelKey {
-    pub fn for_freq(plate: Plate, boundary: Boundary, panel: Panel, cutouts: Vec<Cutout>, freq_max: f64) -> ModelKey {
-        let disc = if panel == Panel::Rectangle && cutouts.is_empty() {
+    pub fn for_freq(
+        plate: Plate,
+        boundary: Boundary,
+        panel: Panel,
+        cutouts: Vec<Cutout>,
+        stiffeners: Vec<Stiffener>,
+        freq_max: f64,
+    ) -> ModelKey {
+        let disc = if panel == Panel::Rectangle && cutouts.is_empty() && stiffeners.is_empty() {
             Discretisation::Analytic(SolveKey::for_freq(plate, boundary, freq_max))
         } else {
             let d = plate.rigidities();
@@ -48,9 +58,9 @@ impl ModelKey {
             if nodes > MAX_FEA_NODES {
                 h *= (nodes / MAX_FEA_NODES).sqrt();
             }
-            Discretisation::Fea { h }
+            Discretisation::Fea { h, freq: freq_max }
         };
-        ModelKey { plate, boundary, panel, cutouts, disc }
+        ModelKey { plate, boundary, panel, cutouts, stiffeners, disc }
     }
 
     fn fea_freq_limit(&self, h: f64) -> f64 {
@@ -83,6 +93,7 @@ impl Model {
         let p = key.plate;
         let shape = key.panel.to_shape(p.lx, p.ly, &key.cutouts);
         shape.validate(&key.cutouts)?;
+        shape.validate_stiffeners(&key.stiffeners)?;
         match key.disc {
             Discretisation::Analytic(sk) => {
                 let sol = plate::solve(sk);
@@ -93,15 +104,25 @@ impl Model {
                 let outline = Outline::new(&shape, p.lx.max(p.ly));
                 Ok(Model { key, modes, freq_limit: sol.freq_limit, outline, data: Data::Analytic(sol) })
             }
-            Discretisation::Fea { h } => {
+            Discretisation::Fea { h, freq } => {
                 let outline = Outline::new(&shape, h);
-                let mesh = mesh::mesh(&outline, h)?;
+                let lines: Vec<Vec<Pt>> = key.stiffeners.iter().map(|s| vec![s.start(), s.end()]).collect();
+                let mesh = mesh::mesh(&outline, h, &lines)?;
+                let beams = key.stiffeners.iter()
+                    .map(|s| {
+                        let (ei, gj, mass_per_len) = section_properties(s, &p);
+                        fem::Beam { nodes: nodes_along(&mesh, s.start(), s.end(), h), ei, gj, mass_per_len }
+                    })
+                    .collect::<Vec<_>>();
                 let pinned: Vec<usize> = match key.boundary {
                     Boundary::Free => Vec::new(),
                     Boundary::SimplySupported => outline_nodes(&mesh, &outline.rings()[0], h),
                 };
-                let freq_limit = key.fea_freq_limit(h);
-                let fe = fem::solve(&mesh, &p.rigidities(), p.rho * p.h, p.rho * p.h.powi(3) / 12.0, freq_limit, &pinned)?;
+                // A mesh finer than the frequency needs (small or thin panels)
+                // resolves far more modes than were asked for; only solve
+                // what was asked for.
+                let freq_limit = key.fea_freq_limit(h).min(freq);
+                let fe = fem::solve(&mesh, &p.rigidities(), p.rho * p.h, p.rho * p.h.powi(3) / 12.0, freq_limit, &pinned, &beams)?;
                 let modes = fe.iter().map(|m| ModeEntry { freq: m.freq, label: None }).collect();
                 let w = fe.into_iter().map(|m| m.w).collect();
                 let locator = Locator::new(&mesh);
@@ -134,6 +155,51 @@ impl Model {
             }
         }
     }
+}
+
+/// Bending stiffness, torsional stiffness and mass per length of a rib.
+///
+/// The rib is bonded to one face, so it bends together with a strip of panel
+/// as a T-section about their shared neutral axis. The panel strip is taken
+/// as an effective width of the rib width plus 10 panel thicknesses each
+/// side (a standard approximation for stiffened plates). The plate elements
+/// already carry that strip's own bending, so only the extra stiffness is
+/// returned. This is an approximation: real composite action depends on how
+/// far the panel's in-plane stiffness lets the strip work with the rib.
+pub fn section_properties(s: &Stiffener, p: &Plate) -> (f64, f64, f64) {
+    let (b, t, h) = (s.width, s.height, p.h);
+    // Panel modulus along the rib (orthotropic directional modulus).
+    let ang = (s.y2 - s.y1).atan2(s.x2 - s.x1);
+    let (c2, s2) = (ang.cos().powi(2), ang.sin().powi(2));
+    let ep = 1.0 / (c2 * c2 / p.ex + s2 * s2 / p.ey + c2 * s2 * (1.0 / p.g - 2.0 * p.nu_xy / p.ex));
+    let flange = b + 20.0 * h;
+    // Neutral axis measured from the panel mid-plane, toward the rib.
+    let y_rib = (h + t) / 2.0;
+    let (ea_flange, ea_rib) = (ep * flange * h, s.e * b * t);
+    let y_na = ea_rib * y_rib / (ea_flange + ea_rib);
+    let ei_composite = ep * (flange * h.powi(3) / 12.0 + flange * h * y_na * y_na)
+        + s.e * (b * t.powi(3) / 12.0 + b * t * (y_rib - y_na).powi(2));
+    let ei = ei_composite - ep * flange * h.powi(3) / 12.0;
+    // St Venant torsion constant of a solid rectangle.
+    let (long, short) = (b.max(t), b.min(t));
+    let j = long * short.powi(3) / 3.0 * (1.0 - 0.63 * short / long);
+    (ei, s.g * j, s.rho * b * t)
+}
+
+/// Mesh nodes on the segment a–b, ordered from a to b.
+fn nodes_along(mesh: &Mesh, a: Pt, b: Pt, h: f64) -> Vec<usize> {
+    let len = dist(a, b);
+    let dir = [(b[0] - a[0]) / len, (b[1] - a[1]) / len];
+    let mut on: Vec<(f64, usize)> = mesh.nodes.iter().enumerate()
+        .filter_map(|(i, p)| {
+            let (vx, vy) = (p[0] - a[0], p[1] - a[1]);
+            let t = vx * dir[0] + vy * dir[1];
+            let off = (vx * dir[1] - vy * dir[0]).abs();
+            (off < 1e-6 * h && t >= -1e-9 && t <= len + 1e-9).then_some((t, i))
+        })
+        .collect();
+    on.sort_by(|x, y| x.0.total_cmp(&y.0));
+    on.into_iter().map(|(_, i)| i).collect()
 }
 
 /// Mesh nodes lying on a ring of the outline.
@@ -242,7 +308,7 @@ mod tests {
 
     #[test]
     fn mesh_evaluator_reproduces_nodal_values_and_masks_outside() {
-        let key = ModelKey::for_freq(acrylic(0.3, 0.3), Boundary::Free, Panel::Ellipse, vec![], 800.0);
+        let key = ModelKey::for_freq(acrylic(0.3, 0.3), Boundary::Free, Panel::Ellipse, vec![], vec![], 800.0);
         let model = Model::solve(key).unwrap();
         assert!(model.modes.len() >= 3);
         // Corners of the bounding box are outside a circle; the centre is inside.
@@ -259,8 +325,8 @@ mod tests {
     #[test]
     fn rounded_rectangle_tends_to_rectangle() {
         let p = acrylic(0.3, 0.2);
-        let rect = Model::solve(ModelKey::for_freq(p, Boundary::Free, Panel::Rectangle, vec![], 1000.0)).unwrap();
-        let nearly = Model::solve(ModelKey::for_freq(p, Boundary::Free, Panel::RoundedRectangle { radius: 0.002 }, vec![], 1000.0)).unwrap();
+        let rect = Model::solve(ModelKey::for_freq(p, Boundary::Free, Panel::Rectangle, vec![], vec![], 1000.0)).unwrap();
+        let nearly = Model::solve(ModelKey::for_freq(p, Boundary::Free, Panel::RoundedRectangle { radius: 0.002 }, vec![], vec![], 1000.0)).unwrap();
         for (a, b) in rect.modes.iter().zip(&nearly.modes).take(10) {
             assert!((a.freq - b.freq).abs() / a.freq < 0.02, "{} vs {}", a.freq, b.freq);
         }
@@ -269,9 +335,9 @@ mod tests {
     #[test]
     fn tiny_hole_barely_changes_modes() {
         let p = acrylic(0.3, 0.2);
-        let plain = Model::solve(ModelKey::for_freq(p, Boundary::Free, Panel::Rectangle, vec![], 1000.0)).unwrap();
+        let plain = Model::solve(ModelKey::for_freq(p, Boundary::Free, Panel::Rectangle, vec![], vec![], 1000.0)).unwrap();
         let holed = Model::solve(ModelKey::for_freq(
-            p, Boundary::Free, Panel::Rectangle, vec![Cutout::Hole { x: 0.11, y: 0.07, d: 0.004 }], 1000.0,
+            p, Boundary::Free, Panel::Rectangle, vec![Cutout::Hole { x: 0.11, y: 0.07, d: 0.004 }], vec![], 1000.0,
         )).unwrap();
         assert!(matches!(holed.key.disc, Discretisation::Fea { .. }));
         for (a, b) in plain.modes.iter().zip(&holed.modes).take(12) {
@@ -283,16 +349,48 @@ mod tests {
     fn slotted_panel_converges_with_mesh_refinement() {
         let p = acrylic(0.3, 0.2);
         let slot = vec![Cutout::Slot { x: 0.15, y: 0.1, length: 0.12, width: 0.01, angle: 90.0 }];
-        let coarse = ModelKey::for_freq(p, Boundary::Free, Panel::Rectangle, slot.clone(), 1500.0);
-        let Discretisation::Fea { h } = coarse.disc else { panic!("expected FEA") };
-        let fine = ModelKey { disc: Discretisation::Fea { h: h / 2.0 }, ..coarse.clone() };
+        let coarse = ModelKey::for_freq(p, Boundary::Free, Panel::Rectangle, slot.clone(), vec![], 1500.0);
+        let Discretisation::Fea { h, freq } = coarse.disc else { panic!("expected FEA") };
+        let fine = ModelKey { disc: Discretisation::Fea { h: h / 2.0, freq }, ..coarse.clone() };
         let (a, b) = (Model::solve(coarse).unwrap(), Model::solve(fine).unwrap());
-        let plain = Model::solve(ModelKey::for_freq(p, Boundary::Free, Panel::Rectangle, vec![], 1500.0)).unwrap();
+        let plain = Model::solve(ModelKey::for_freq(p, Boundary::Free, Panel::Rectangle, vec![], vec![], 1500.0)).unwrap();
         for (x, y) in a.modes.iter().zip(&b.modes).take(15) {
             assert!((x.freq - y.freq).abs() / y.freq < 0.02, "{} vs {}", x.freq, y.freq);
         }
         // A slot across the middle cuts the panel's bending path along x,
         // so the first (2,0)-type bending modes must drop.
         assert!(b.modes[1].freq < plain.modes[1].freq * 0.98, "{} vs {}", b.modes[1].freq, plain.modes[1].freq);
+    }
+
+    fn rib(x1: f64, y1: f64, x2: f64, y2: f64, width: f64, height: f64) -> Stiffener {
+        // Aluminium bar.
+        Stiffener { x1, y1, x2, y2, width, height, e: 69e9, g: 26e9, rho: 2700.0 }
+    }
+
+    #[test]
+    fn negligible_stiffener_changes_nothing() {
+        let p = acrylic(0.3, 0.2);
+        let plain = Model::solve(ModelKey::for_freq(p, Boundary::Free, Panel::Rectangle, vec![], vec![], 1000.0)).unwrap();
+        let tiny = vec![rib(0.05, 0.07, 0.25, 0.13, 1e-5, 1e-5)];
+        let ribbed = Model::solve(ModelKey::for_freq(p, Boundary::Free, Panel::Rectangle, vec![], tiny, 1000.0)).unwrap();
+        for (a, b) in plain.modes.iter().zip(&ribbed.modes).take(12) {
+            assert!((a.freq - b.freq).abs() / a.freq < 0.02, "{} vs {}", a.freq, b.freq);
+        }
+    }
+
+    #[test]
+    fn stiffened_strip_matches_beam_theory() {
+        // A narrow acrylic strip with a deep aluminium rib along its length
+        // behaves as a free-free beam: f₁ = 22.373/(2πL²)·√(EI/m).
+        let mut p = acrylic(0.3, 0.02);
+        p.h = 0.001;
+        let r = rib(0.002, 0.01, 0.298, 0.01, 0.006, 0.015);
+        let (ei_rib, _, m_rib) = section_properties(&r, &p);
+        let ei = ei_rib + p.rigidities().d11 * p.ly;
+        let m = m_rib + p.rho * p.h * p.ly;
+        let expected = 22.373 / (2.0 * PI * p.lx * p.lx) * (ei / m).sqrt();
+        let model = Model::solve(ModelKey::for_freq(p, Boundary::Free, Panel::Rectangle, vec![], vec![r], expected * 1.5)).unwrap();
+        let nearest = model.modes.iter().map(|m| m.freq).min_by(|a, b| (a - expected).abs().total_cmp(&(b - expected).abs())).unwrap();
+        assert!((nearest - expected).abs() / expected < 0.04, "FEA {nearest:.1} Hz vs beam theory {expected:.1} Hz");
     }
 }

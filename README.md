@@ -38,6 +38,7 @@ The panel is a thin (Kirchhoff) plate of orthotropic material: stiffness can dif
 - **Exciter size** — voice-coil diameter, which averages out modes smaller than the coil
 - **Panel shapes** — rectangle (exact solver), plus rounded rectangle, ellipse/circle and regular polygon (finite-element analysis)
 - **Cutouts** — round holes and slots (any angle); slots cut the bending path across them, lowering those modes and adding modal density
+- **Stiffeners** — straight ribs glued to one face, like a violin's bass bar; they stiffen the panel along their length and redistribute the modes
 - **Both boundary conditions** — free edges (realistic for DML) and simply supported
 - **Heat map** — colour-coded placement score rendered on a proportional canvas, updates live as you change parameters
 - **Response chart** — predicted response at the best position; click anywhere on the panel to compare that position
@@ -80,7 +81,7 @@ npm run tauri build
 | C — Calibration | Planned | Fit stiffness to tap-test frequencies; overlay REW measurements |
 | D1 — FEA engine | **Done** | Native Rust FEA (DKT elements, sparse eigen-solver); rounded-rectangle, ellipse/circle and polygon panels |
 | D2 — Cutouts | **Done** | Round holes and rounded-end slots at any angle |
-| D3 — Stiffeners | Planned | Bonded ribs and bars |
+| D3 — Stiffeners | **Done** | Straight ribs glued to one face (spruce, carbon, aluminium or panel material) |
 | D4 — Custom outlines | Planned | Bézier-curve outline editor |
 | E — Radiation | Optional | Baffled-panel SPL estimate via the Rayleigh integral |
 
