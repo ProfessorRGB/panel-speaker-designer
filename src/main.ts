@@ -4,6 +4,9 @@ import { ModeDensityChart, ResponseChart, Series } from "./charts";
 // ── Types ────────────────────────────────────────────────────────────────────
 
 interface PanelParams {
+  shape: string;
+  corner_r: number;
+  sides: number;
   lx: number;
   ly: number;
   h: number;
@@ -21,25 +24,30 @@ interface PanelParams {
 }
 
 interface ModeInfo {
-  m: number;
-  n: number;
+  m: number | null;  // nodal-line counts; null where not meaningful
+  n: number | null;
   freq: number;
 }
 
+// Grid cells: candidate positions, edge margin, and outside the panel.
+const REGION_MARGIN = 1;
+const REGION_OUTSIDE = 2;
+
 interface CalculationResult {
-  grid: number[];
-  grid_raw: number[];
+  grid: (number | null)[];      // null outside the panel
+  grid_raw: (number | null)[];
+  region: number[];
+  outline: [number, number][][];  // outline and hole rings, normalised
   grid_n: number;
   modes: ModeInfo[];
   mode_count: number;
   optimal_x: number;
   optimal_y: number;
   optimal_score_raw: number;
-  margin_x: number;
-  margin_y: number;
   bands: number[];
   response_opt: number[];
   raggedness_opt: number;
+  solver: "analytic" | "fea";
   truncated_above: number | null;
 }
 
@@ -78,7 +86,7 @@ const SHAPE_GRID_N = 120;
 let lastResult: CalculationResult | null = null;
 let lastParams: PanelParams | null = null;
 let selectedModeIdx = -1;
-let selectedShape: number[] | null = null;
+let selectedShape: (number | null)[] | null = null;
 let calcTimer: ReturnType<typeof setTimeout> | null = null;
 let requestId = 0;  // newer calculations supersede older in-flight ones
 
@@ -90,6 +98,9 @@ let probe: Probe | null = null;
 
 const $ = (id: string) => document.getElementById(id)!;
 
+const selectShape    = $("shape")      as HTMLSelectElement;
+const inputCornerR   = $("corner-r")   as HTMLInputElement;
+const inputSides     = $("sides")      as HTMLInputElement;
 const inputLx        = $("lx")         as HTMLInputElement;
 const inputLy        = $("ly")         as HTMLInputElement;
 const inputH         = $("h")          as HTMLInputElement;
@@ -187,45 +198,50 @@ function render() {
   const ox = Math.round((cw - pw) / 2);  // panel offset x
   const oy = Math.round((ch - ph) / 2);
 
-  const { grid, grid_n, optimal_x, optimal_y, margin_x, margin_y } = lastResult;
+  const { grid, grid_n, region, outline, optimal_x, optimal_y } = lastResult;
 
   // ── Heat map ───────────────────────────────────────────────────────────────
   const cellW = pw / grid_n;
   const cellH = ph / grid_n;
 
-  for (let row = 0; row < grid_n; row++) {
-    for (let col = 0; col < grid_n; col++) {
-      const v = grid[row * grid_n + col];
-      const [r, g, b] = sampleColormap(v);
-      ctx.fillStyle = `rgb(${r},${g},${b})`;
-      ctx.fillRect(
-        ox + col * cellW,
-        oy + row * cellH,
-        Math.ceil(cellW),
-        Math.ceil(cellH),
-      );
-    }
+  // The panel's real outline (and holes), used to clip and to draw the border.
+  const outlinePath = new Path2D();
+  for (const ring of outline) {
+    ring.forEach(([x, y], i) => {
+      const px = ox + x * pw, py = oy + y * ph;
+      if (i === 0) outlinePath.moveTo(px, py); else outlinePath.lineTo(px, py);
+    });
+    outlinePath.closePath();
   }
 
-  // ── Edge margin ───────────────────────────────────────────────────────────
-  // Excluded from the search; the colour scale is set by the interior, so
-  // these cells are clipped. Dim them to show they aren't candidates.
-  const mx = margin_x * pw;
-  const my = margin_y * ph;
-  ctx.fillStyle = "rgba(0,0,0,0.45)";
-  ctx.beginPath();
-  ctx.rect(ox, oy, pw, ph);
-  ctx.rect(ox + mx, oy + ph - my, pw - 2 * mx, -(ph - 2 * my));  // reverse winding cuts a hole
-  ctx.fill("evenodd");
-  ctx.strokeStyle = "rgba(255,255,255,0.25)";
-  ctx.setLineDash([3, 3]);
-  ctx.strokeRect(ox + mx, oy + my, pw - 2 * mx, ph - 2 * my);
-  ctx.setLineDash([]);
+  // Cells straddling a curved edge have their centre outside the panel;
+  // borrow a neighbour's value so the clipped edge has no gaps.
+  const display = fillOutside(grid, grid_n);
+  ctx.save();
+  ctx.clip(outlinePath, "evenodd");
+  for (let row = 0; row < grid_n; row++) {
+    for (let col = 0; col < grid_n; col++) {
+      const i = row * grid_n + col;
+      const v = display[i];
+      if (v === null) continue;
+      const [r, g, b] = sampleColormap(v);
+      ctx.fillStyle = `rgb(${r},${g},${b})`;
+      const x = ox + col * cellW, y = oy + row * cellH;
+      ctx.fillRect(x, y, Math.ceil(cellW), Math.ceil(cellH));
+      // Edge margin: excluded from the search, and the colour scale is set
+      // by the interior, so these cells are clipped. Dim them.
+      if (region[i] !== 0) {
+        ctx.fillStyle = "rgba(0,0,0,0.45)";
+        ctx.fillRect(x, y, Math.ceil(cellW), Math.ceil(cellH));
+      }
+    }
+  }
+  ctx.restore();
 
   // ── Panel border ──────────────────────────────────────────────────────────
   ctx.strokeStyle = "rgba(255,255,255,0.5)";
   ctx.lineWidth = 1;
-  ctx.strokeRect(ox, oy, pw, ph);
+  ctx.stroke(outlinePath);
 
   // ── Mode node lines ───────────────────────────────────────────────────────
   if (selectedShape) {
@@ -286,11 +302,35 @@ function render() {
 
 }
 
+/** Copy of `grid` with outside (null) cells next to the panel filled from
+ *  their neighbours, two cells deep. */
+function fillOutside(grid: (number | null)[], n: number): (number | null)[] {
+  let cur = grid.slice();
+  for (let pass = 0; pass < 2; pass++) {
+    const next = cur.slice();
+    for (let i = 0; i < n * n; i++) {
+      if (cur[i] !== null) continue;
+      const row = Math.floor(i / n), col = i % n;
+      let sum = 0, count = 0;
+      for (const [dr, dc] of [[-1, 0], [1, 0], [0, -1], [0, 1]]) {
+        const r = row + dr, c = col + dc;
+        if (r < 0 || c < 0 || r >= n || c >= n) continue;
+        const v = cur[r * n + c];
+        if (v !== null) { sum += v; count++; }
+      }
+      if (count) next[i] = sum / count;
+    }
+    cur = next;
+  }
+  return cur;
+}
+
 // Traces the zero contour of a mode shape (its node lines) with marching
-// squares. `shape` is n×n, row-major, sampled at cell centres.
+// squares. `shape` is n×n, row-major, sampled at cell centres; null cells
+// (outside the panel) are skipped.
 function drawNodeLines(
   ctx: CanvasRenderingContext2D,
-  shape: number[], n: number,
+  shape: (number | null)[], n: number,
   ox: number, oy: number,
   pw: number, ph: number,
 ) {
@@ -301,10 +341,12 @@ function drawNodeLines(
 
   const px = (col: number) => ox + ((col + 0.5) / n) * pw;
   const py = (row: number) => oy + ((row + 0.5) / n) * ph;
-  const at = (row: number, col: number) => shape[row * n + col];
+  const at = (row: number, col: number) => shape[row * n + col] as number;
 
   for (let row = 0; row < n - 1; row++) {
     for (let col = 0; col < n - 1; col++) {
+      if ([shape[row * n + col], shape[row * n + col + 1], shape[(row + 1) * n + col], shape[(row + 1) * n + col + 1]]
+        .some((v) => v === null)) continue;
       // Corners clockwise from top-left, and the edges between them.
       const corners: [number, number][] = [[row, col], [row, col + 1], [row + 1, col + 1], [row + 1, col]];
       const crossings: [number, number][] = [];
@@ -334,6 +376,9 @@ function drawNodeLines(
 
 function getParams(): PanelParams {
   return {
+    shape:     selectShape.value,
+    corner_r:  Math.max(0, parseFloat(inputCornerR.value) || 0) / 1000,
+    sides:     Math.min(64, Math.max(3, parseInt(inputSides.value) || 6)),
     lx:        parseFloat(inputLx.value) / 1000,
     ly:        parseFloat(inputLy.value) / 1000,
     h:         parseFloat(inputH.value)  / 1000,
@@ -402,10 +447,11 @@ async function calculate() {
     if (id !== requestId) return;
     render();
     updateCharts();
+    const solver = result.solver === "fea" ? " · FEA" : "";
     if (result.truncated_above !== null) {
-      setStatus("done", `Modes above ${Math.round(result.truncated_above)} Hz omitted (solver limit)`);
+      setStatus("done", `Modes above ${Math.round(result.truncated_above)} Hz omitted (solver limit)${solver}`);
     } else {
-      setStatus("done", "Ready");
+      setStatus("done", `Ready${solver}`);
     }
   } catch (err) {
     if (id !== requestId) return;
@@ -500,13 +546,13 @@ function updateUI(result: CalculationResult, params: PanelParams) {
   badgeModes.textContent = `${result.mode_count} modes`;
 
   // Free-plate labels count node lines and are approximate; many modes mix
-  // several patterns.
+  // several patterns. FEA modes (non-rectangular shapes) have no label.
   const approx = params.boundary === "free" ? "≈" : "";
-  const label = (m: ModeInfo) => `${approx}(${m.m},${m.n})`;
+  const label = (m: ModeInfo) => (m.m === null ? "" : `${approx}(${m.m},${m.n})`);
 
   // Lowest frequency
   if (result.modes.length > 0) {
-    valF1.textContent = `${result.modes[0].freq.toFixed(1)} Hz  ${label(result.modes[0])}`;
+    valF1.textContent = `${result.modes[0].freq.toFixed(1)} Hz  ${label(result.modes[0])}`.trim();
   } else {
     valF1.textContent = "—";
   }
@@ -518,7 +564,7 @@ function updateUI(result: CalculationResult, params: PanelParams) {
     const m = result.modes[i];
     const opt = document.createElement("option");
     opt.value = String(i);
-    opt.textContent = `${i + 1}. ${label(m)}  ${m.freq.toFixed(0)} Hz`;
+    opt.textContent = `${i + 1}. ${label(m)}  ${m.freq.toFixed(0)} Hz`.replace(/\s+/g, " ");
     selectMode.appendChild(opt);
   }
   selectedModeIdx = prev < result.modes.length ? prev : -1;
@@ -567,17 +613,21 @@ canvas.addEventListener("mousemove", (e) => {
   }
 
   const { normX, normY, x, y } = pos;
-  const { grid, grid_n } = lastResult;
+  const { grid, grid_n, region } = lastResult;
   const col = Math.min(Math.floor(normX * grid_n), grid_n - 1);
   const row = Math.min(Math.floor(normY * grid_n), grid_n - 1);
-  const normScore = grid[row * grid_n + col];
+  const cell = row * grid_n + col;
+  if (region[cell] === REGION_OUTSIDE) {
+    tooltip.classList.remove("visible");
+    valCursor.textContent = "—";
+    return;
+  }
+  const normScore = grid[cell] ?? 0;
 
   valCursor.textContent = `${x.toFixed(1)} × ${y.toFixed(1)} mm`;
 
-  const inMargin =
-    normX < lastResult.margin_x || normX > 1 - lastResult.margin_x ||
-    normY < lastResult.margin_y || normY > 1 - lastResult.margin_y;
-  const raw = lastResult.grid_raw[row * grid_n + col];
+  const inMargin = region[cell] === REGION_MARGIN;
+  const raw = lastResult.grid_raw[cell] ?? 0;
   const scoreText = inMargin
     ? "edge margin"
     : lastParams?.score === "coupling"
@@ -596,7 +646,10 @@ canvas.addEventListener("mousemove", (e) => {
 
 canvas.addEventListener("click", async (e) => {
   const pos = canvasToPanel(e.clientX, e.clientY);
-  if (!pos || !lastParams) return;
+  if (!pos || !lastParams || !lastResult) return;
+  const n = lastResult.grid_n;
+  const cell = Math.min(Math.floor(pos.normY * n), n - 1) * n + Math.min(Math.floor(pos.normX * n), n - 1);
+  if (lastResult.region[cell] === REGION_OUTSIDE) return;
   probe = { x: pos.normX, y: pos.normY, db: [], raggedness: 0 };
   const id = requestId;
   await loadProbe();
@@ -613,7 +666,7 @@ canvas.addEventListener("mouseleave", () => {
 // ── Input listeners ───────────────────────────────────────────────────────────
 
 const numericInputs = [
-  inputLx, inputLy, inputH, inputEx, inputEy, inputG, inputRho, inputNu,
+  inputCornerR, inputSides, inputLx, inputLy, inputH, inputEx, inputEy, inputG, inputRho, inputNu,
   inputFreqMax, inputExciterD, inputEta, inputGridN,
 ];
 numericInputs.forEach((el) => el.addEventListener("input", scheduleCalculate));
@@ -625,6 +678,19 @@ checkIsotropic.addEventListener("change", () => {
 });
 
 selectBoundary.addEventListener("change", scheduleCalculate);
+
+// Shape-specific fields.
+function syncShapeFields() {
+  const shape = selectShape.value;
+  $("field-corner-r").hidden = shape !== "rounded_rectangle";
+  $("field-sides").hidden = shape !== "polygon";
+  $("shape-hint").hidden = shape === "rectangle";
+}
+selectShape.addEventListener("change", () => {
+  syncShapeFields();
+  probe = null;  // a clicked position may not be on the new shape
+  scheduleCalculate();
+});
 selectScore.addEventListener("change", scheduleCalculate);
 
 selectMaterial.addEventListener("change", () => {
@@ -665,5 +731,6 @@ chartObserver.observe($("chart-panel"));
 
 window.addEventListener("DOMContentLoaded", () => {
   syncIsotropic();
+  syncShapeFields();
   calculate();
 });

@@ -21,6 +21,15 @@
       <!-- Geometry -->
       <section class="input-section">
         <div class="section-label">Geometry</div>
+        <div class="field full-width">
+          <label for="shape">Shape</label>
+          <select id="shape">
+            <option value="rectangle" selected>Rectangle</option>
+            <option value="rounded_rectangle">Rounded rectangle</option>
+            <option value="ellipse">Ellipse / circle</option>
+            <option value="polygon">Regular polygon</option>
+          </select>
+        </div>
         <div class="field">
           <label for="lx">Width</label>
           <div class="input-with-unit">
@@ -35,6 +44,18 @@
             <span class="unit">mm</span>
           </div>
         </div>
+        <div class="field" id="field-corner-r" hidden>
+          <label for="corner-r">Corner radius</label>
+          <div class="input-with-unit">
+            <input type="number" id="corner-r" value="30" min="0" max="1500" step="1"/>
+            <span class="unit">mm</span>
+          </div>
+        </div>
+        <div class="field" id="field-sides" hidden>
+          <label for="sides">Sides</label>
+          <input type="number" id="sides" value="6" min="3" max="64" step="1"/>
+        </div>
+        <div class="field-hint" id="shape-hint" hidden>Width and height set the bounding box. Shapes other than rectangles are solved by finite-element analysis, which takes about a second.</div>
         <div class="field">
           <label for="h">Thickness</label>
           <div class="input-with-unit">

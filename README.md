@@ -24,6 +24,8 @@ The panel is a thin (Kirchhoff) plate of orthotropic material: stiffness can dif
 
 **Simply supported:** exact `sin(mπx/Lx) · sin(nπy/Ly)` shapes with the orthotropic frequency formula.
 
+**Other shapes (FEA):** the outline is meshed into triangles and solved with DKT thin-plate elements and a sparse eigen-solver, all in Rust. The mesh is sized from the frequency range (five elements per half-wavelength), giving about 1–2% frequency error at the top of the band. Verified against the rectangle solver, the exact simply-supported solution, and Leissa's values for a free circular plate.
+
 **Coupling:** an exciter drives the panel around its voice-coil ring, so its coupling to each mode is the mode shape averaged around that ring.
 
 **Response and placement score:** from the couplings, the damped modal response gives the panel's average vibration level across frequency (in 1/12-octave bands, with the loss factor η setting damping). Placement is scored by *raggedness*: how far the response wanders, in dB RMS, from its own octave-smoothed trend. The overall slope is set by the panel; peaks and dips are what exciter position controls. The older score (sum of `|coupling|`) is still available. This is a vibration measure, not radiated sound pressure. The search excludes a 10% edge margin, since free edges move far more than anywhere practical to mount an exciter, and the heat map's colour scale is set by the interior for the same reason.
@@ -34,6 +36,7 @@ The panel is a thin (Kirchhoff) plate of orthotropic material: stiffness can dif
 
 - **7 material presets** — XPS foam, EPS foam, balsa, birch plywood, acrylic, aluminium, carbon fibre — with fields that auto-fill and remain editable; balsa and plywood are orthotropic (grain along the width)
 - **Exciter size** — voice-coil diameter, which averages out modes smaller than the coil
+- **Panel shapes** — rectangle (exact solver), plus rounded rectangle, ellipse/circle and regular polygon (finite-element analysis)
 - **Both boundary conditions** — free edges (realistic for DML) and simply supported
 - **Heat map** — colour-coded placement score rendered on a proportional canvas, updates live as you change parameters
 - **Response chart** — predicted response at the best position; click anywhere on the panel to compare that position
@@ -74,7 +77,10 @@ npm run tauri build
 | A — Accurate modes | **Done** | Rayleigh-Ritz free-edge modes, orthotropic materials, exciter footprint |
 | B — Response scoring | **Done** | Damped modal response; score placement by flatness; modes-per-octave plot |
 | C — Calibration | Planned | Fit stiffness to tap-test frequencies; overlay REW measurements |
-| D — FEA | Planned | One solver for arbitrary outlines, cutouts and stiffeners (preferably native Rust) |
+| D1 — FEA engine | **Done** | Native Rust FEA (DKT elements, sparse eigen-solver); rounded-rectangle, ellipse/circle and polygon panels |
+| D2 — Cutouts | Planned | Holes and slots |
+| D3 — Stiffeners | Planned | Bonded ribs and bars |
+| D4 — Custom outlines | Planned | Bézier-curve outline editor |
 | E — Radiation | Optional | Baffled-panel SPL estimate via the Rayleigh integral |
 
 The original plan (separate SfePy and FEniCSx phases via a Python sidecar) was revised so that model accuracy and calibration come before geometry features.
