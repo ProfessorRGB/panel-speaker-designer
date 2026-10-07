@@ -18,27 +18,26 @@ This tool calculates the plate mode shapes analytically and scores every possibl
 
 ## Physics
 
-For a rectangular isotropic plate, mode frequencies follow the thin-plate dispersion relation:
+The panel is a thin (Kirchhoff) plate of orthotropic material: stiffness can differ along the width (`E_x`, e.g. along the grain) and height (`E_y`), with shear modulus `G` controlling twisting. Isotropic materials are the special case `E_x = E_y`, `G = E/2(1+ν)`.
 
-```
-f_mn = (1/2π) · √(D/ρh) · ((mπ/Lx)² + (nπ/Ly)²)
-```
+**Free edges (DML):** mode shapes and frequencies come from a Rayleigh-Ritz solution using Legendre polynomials. This gives the true free-edge modes, including their larger motion near the edges, rather than the common `cos·cos` approximation, which misplaces free-edge frequencies by up to ~2× (and much more for wood). Results match Leissa's published values for a free square plate to within 0.5%. Rigid-body modes are excluded.
 
-where `D = Eh³ / 12(1−ν²)` is the bending stiffness.
+**Simply supported:** exact `sin(mπx/Lx) · sin(nπy/Ly)` shapes with the orthotropic frequency formula.
 
-**Free edges (DML):** mode shapes approximated as `cos(mπx/Lx) · cos(nπy/Ly)` — the standard analytical approach used in DML research. Rigid-body modes (m+n < 2) are excluded. The optimal position search excludes a 10% edge margin, since corners are trivially at maximum amplitude for every cosine mode and are impractical mounting locations.
+**Coupling:** an exciter drives the panel around its voice-coil ring, so its coupling to each mode is the mode shape averaged around that ring.
 
-**Simply supported:** mode shapes are `sin(mπx/Lx) · sin(nπy/Ly)`, modes start at (1,1).
-
-The placement score at a point is the sum of `|mode_shape(x,y)|` across all modes below the chosen frequency cutoff.
+**Response and placement score:** from the couplings, the damped modal response gives the panel's average vibration level across frequency (in 1/12-octave bands, with the loss factor η setting damping). Placement is scored by *raggedness*: how far the response wanders, in dB RMS, from its own octave-smoothed trend. The overall slope is set by the panel; peaks and dips are what exciter position controls. The older score (sum of `|coupling|`) is still available. This is a vibration measure, not radiated sound pressure. The search excludes a 10% edge margin, since free edges move far more than anywhere practical to mount an exciter, and the heat map's colour scale is set by the interior for the same reason.
 
 ---
 
 ## Features
 
-- **7 material presets** — XPS foam, EPS foam, balsa, birch plywood, acrylic, aluminium, carbon fibre — with E / ρ / ν fields that auto-fill and remain editable
+- **7 material presets** — XPS foam, EPS foam, balsa, birch plywood, acrylic, aluminium, carbon fibre — with fields that auto-fill and remain editable; balsa and plywood are orthotropic (grain along the width)
+- **Exciter size** — voice-coil diameter, which averages out modes smaller than the coil
 - **Both boundary conditions** — free edges (realistic for DML) and simply supported
 - **Heat map** — colour-coded placement score rendered on a proportional canvas, updates live as you change parameters
+- **Response chart** — predicted response at the best position; click anywhere on the panel to compare that position
+- **Modal density** — modes per ⅓ octave, with empty bands flagged
 - **Mode node-line overlay** — select any mode from the dropdown to see its node lines drawn on the panel
 - **Hover inspection** — move the cursor over the panel to read the score at any position
 
@@ -71,12 +70,14 @@ npm run tauri build
 
 | Phase | Status | Scope |
 |---|---|---|
-| 1 — Analytical | **Done** | Rectangular panel, isotropic material, placement heat map |
-| 2 — Modal density | Planned | Modes-per-octave plot, frequency coverage score |
-| 3 — Simple FEA | Planned | Non-rectangular geometry via Gmsh + SfePy |
-| 4 — Full FEA | Planned | Stiffeners, cutouts, anisotropic materials via FEniCSx |
+| 1 — Analytical | **Done** | Rectangular panel, placement heat map |
+| A — Accurate modes | **Done** | Rayleigh-Ritz free-edge modes, orthotropic materials, exciter footprint |
+| B — Response scoring | **Done** | Damped modal response; score placement by flatness; modes-per-octave plot |
+| C — Calibration | Planned | Fit stiffness to tap-test frequencies; overlay REW measurements |
+| D — FEA | Planned | One solver for arbitrary outlines, cutouts and stiffeners (preferably native Rust) |
+| E — Radiation | Optional | Baffled-panel SPL estimate via the Rayleigh integral |
 
-FEA phases will use a Python sidecar process, keeping the same interface.
+The original plan (separate SfePy and FEniCSx phases via a Python sidecar) was revised so that model accuracy and calibration come before geometry features.
 
 ---
 
