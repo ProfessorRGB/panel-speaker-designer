@@ -6,12 +6,15 @@ interface PanelParams {
   lx: number;
   ly: number;
   h: number;
-  e: number;
-  rho: number;
+  ex: number;
+  ey: number;
+  g: number;
   nu: number;
+  rho: number;
   boundary: string;
   freq_max: number;
   grid_n: number;
+  exciter_d: number;
 }
 
 interface ModeInfo {
@@ -28,25 +31,44 @@ interface CalculationResult {
   optimal_x: number;
   optimal_y: number;
   optimal_score_raw: number;
+  margin_x: number;
+  margin_y: number;
+  truncated_above: number | null;
 }
 
 // ── Material presets ─────────────────────────────────────────────────────────
+// Moduli in MPa. Isotropic presets derive E_y and G from E_x and ν.
+// Wood values are typical; real sheets vary widely, so measure if you can.
 
-const MATERIALS: Record<string, { e: number; rho: number; nu: number }> = {
-  xps:      { e: 20,    rho: 32,   nu: 0.35 },  // XPS foam, E in MPa
-  eps:      { e: 5,     rho: 20,   nu: 0.10 },  // EPS foam
-  balsa:    { e: 3700,  rho: 130,  nu: 0.30 },  // Balsa wood
-  birch:    { e: 9700,  rho: 680,  nu: 0.30 },  // Birch plywood
-  acrylic:  { e: 3200,  rho: 1190, nu: 0.37 },  // PMMA
-  aluminum: { e: 69000, rho: 2700, nu: 0.33 },  // Aluminium
-  carbon:   { e: 70000, rho: 1600, nu: 0.10 },  // CFRP (isotropic estimate)
+interface Material {
+  ex: number;
+  rho: number;
+  nu: number;
+  ey?: number;  // set for orthotropic materials
+  g?: number;
+}
+
+const MATERIALS: Record<string, Material> = {
+  xps:      { ex: 20,    rho: 32,   nu: 0.35 },                     // XPS foam
+  eps:      { ex: 5,     rho: 20,   nu: 0.10 },                     // EPS foam
+  balsa:    { ex: 3000,  rho: 130,  nu: 0.30, ey: 90,   g: 120 },   // Balsa, grain along x
+  birch:    { ex: 10000, rho: 680,  nu: 0.07, ey: 5500, g: 620 },   // Birch plywood, face grain along x
+  acrylic:  { ex: 3200,  rho: 1190, nu: 0.37 },                     // PMMA
+  aluminum: { ex: 69000, rho: 2700, nu: 0.33 },                     // Aluminium
+  carbon:   { ex: 70000, rho: 1600, nu: 0.10 },                     // CFRP, quasi-isotropic estimate
 };
+
+// Resolution of the mode shape used to trace node lines.
+const SHAPE_GRID_N = 120;
 
 // ── State ────────────────────────────────────────────────────────────────────
 
 let lastResult: CalculationResult | null = null;
+let lastParams: PanelParams | null = null;
 let selectedModeIdx = -1;
+let selectedShape: number[] | null = null;
 let calcTimer: ReturnType<typeof setTimeout> | null = null;
+let requestId = 0;  // newer calculations supersede older in-flight ones
 
 // ── DOM refs ─────────────────────────────────────────────────────────────────
 
@@ -55,12 +77,16 @@ const $ = (id: string) => document.getElementById(id)!;
 const inputLx        = $("lx")         as HTMLInputElement;
 const inputLy        = $("ly")         as HTMLInputElement;
 const inputH         = $("h")          as HTMLInputElement;
-const inputE         = $("e")          as HTMLInputElement;
+const checkIsotropic = $("isotropic")  as HTMLInputElement;
+const inputEx        = $("ex")         as HTMLInputElement;
+const inputEy        = $("ey")         as HTMLInputElement;
+const inputG         = $("g")          as HTMLInputElement;
 const inputRho       = $("rho")        as HTMLInputElement;
 const inputNu        = $("nu")         as HTMLInputElement;
 const selectMaterial = $("material-preset") as HTMLSelectElement;
 const selectBoundary = $("boundary")   as HTMLSelectElement;
 const inputFreqMax   = $("freq-max")   as HTMLInputElement;
+const inputExciterD  = $("exciter-d")  as HTMLInputElement;
 const inputGridN     = $("grid-n")     as HTMLInputElement;
 const selectMode     = $("mode-select") as HTMLSelectElement;
 
@@ -136,7 +162,7 @@ function render() {
   const ox = Math.round((cw - pw) / 2);  // panel offset x
   const oy = Math.round((ch - ph) / 2);
 
-  const { grid, grid_n, optimal_x, optimal_y, modes } = lastResult;
+  const { grid, grid_n, optimal_x, optimal_y, margin_x, margin_y } = lastResult;
 
   // ── Heat map ───────────────────────────────────────────────────────────────
   const cellW = pw / grid_n;
@@ -156,16 +182,29 @@ function render() {
     }
   }
 
+  // ── Edge margin ───────────────────────────────────────────────────────────
+  // Excluded from the search; the colour scale is set by the interior, so
+  // these cells are clipped. Dim them to show they aren't candidates.
+  const mx = margin_x * pw;
+  const my = margin_y * ph;
+  ctx.fillStyle = "rgba(0,0,0,0.45)";
+  ctx.beginPath();
+  ctx.rect(ox, oy, pw, ph);
+  ctx.rect(ox + mx, oy + ph - my, pw - 2 * mx, -(ph - 2 * my));  // reverse winding cuts a hole
+  ctx.fill("evenodd");
+  ctx.strokeStyle = "rgba(255,255,255,0.25)";
+  ctx.setLineDash([3, 3]);
+  ctx.strokeRect(ox + mx, oy + my, pw - 2 * mx, ph - 2 * my);
+  ctx.setLineDash([]);
+
   // ── Panel border ──────────────────────────────────────────────────────────
   ctx.strokeStyle = "rgba(255,255,255,0.5)";
   ctx.lineWidth = 1;
   ctx.strokeRect(ox, oy, pw, ph);
 
   // ── Mode node lines ───────────────────────────────────────────────────────
-  if (selectedModeIdx >= 0 && selectedModeIdx < modes.length) {
-    const mode = modes[selectedModeIdx];
-    const boundary = selectBoundary.value;
-    drawNodeLines(ctx, mode.m, mode.n, boundary, ox, oy, pw, ph);
+  if (selectedShape) {
+    drawNodeLines(ctx, selectedShape, SHAPE_GRID_N, ox, oy, pw, ph);
   }
 
   // ── Optimal position crosshair ────────────────────────────────────────────
@@ -208,45 +247,47 @@ function render() {
 
 }
 
+// Traces the zero contour of a mode shape (its node lines) with marching
+// squares. `shape` is n×n, row-major, sampled at cell centres.
 function drawNodeLines(
   ctx: CanvasRenderingContext2D,
-  m: number, n: number,
-  boundary: string,
+  shape: number[], n: number,
   ox: number, oy: number,
   pw: number, ph: number,
 ) {
   ctx.save();
   ctx.strokeStyle = "rgba(255, 220, 60, 0.85)";
-  ctx.lineWidth = 1;
-  ctx.setLineDash([4, 3]);
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
 
-  const xLines: number[] = [];
-  const yLines: number[] = [];
+  const px = (col: number) => ox + ((col + 0.5) / n) * pw;
+  const py = (row: number) => oy + ((row + 0.5) / n) * ph;
+  const at = (row: number, col: number) => shape[row * n + col];
 
-  if (boundary === "simply_supported") {
-    for (let k = 1; k < m; k++) xLines.push(k / m);
-    for (let k = 1; k < n; k++) yLines.push(k / n);
-  } else {
-    // Free: zeros of cos(mπx/L) at x=(2k+1)/(2m) for k=0..m-1
-    for (let k = 0; k < m; k++) xLines.push((2 * k + 1) / (2 * m));
-    for (let k = 0; k < n; k++) yLines.push((2 * k + 1) / (2 * n));
+  for (let row = 0; row < n - 1; row++) {
+    for (let col = 0; col < n - 1; col++) {
+      // Corners clockwise from top-left, and the edges between them.
+      const corners: [number, number][] = [[row, col], [row, col + 1], [row + 1, col + 1], [row + 1, col]];
+      const crossings: [number, number][] = [];
+      for (let k = 0; k < 4; k++) {
+        const [r0, c0] = corners[k];
+        const [r1, c1] = corners[(k + 1) % 4];
+        const v0 = at(r0, c0);
+        const v1 = at(r1, c1);
+        if ((v0 < 0) !== (v1 < 0)) {
+          const t = v0 / (v0 - v1);
+          crossings.push([px(c0 + t * (c1 - c0)), py(r0 + t * (r1 - r0))]);
+        }
+      }
+      // Two crossings: one segment. Four (a saddle): pair them in edge order.
+      for (let k = 0; k + 1 < crossings.length; k += 2) {
+        ctx.moveTo(...crossings[k]);
+        ctx.lineTo(...crossings[k + 1]);
+      }
+    }
   }
 
-  for (const t of xLines) {
-    const px = ox + t * pw;
-    ctx.beginPath();
-    ctx.moveTo(px, oy);
-    ctx.lineTo(px, oy + ph);
-    ctx.stroke();
-  }
-  for (const t of yLines) {
-    const py = oy + t * ph;
-    ctx.beginPath();
-    ctx.moveTo(ox, py);
-    ctx.lineTo(ox + pw, py);
-    ctx.stroke();
-  }
-
+  ctx.stroke();
   ctx.restore();
 }
 
@@ -254,16 +295,34 @@ function drawNodeLines(
 
 function getParams(): PanelParams {
   return {
-    lx:       parseFloat(inputLx.value) / 1000,
-    ly:       parseFloat(inputLy.value) / 1000,
-    h:        parseFloat(inputH.value)  / 1000,
-    e:        parseFloat(inputE.value)  * 1e6,   // MPa → Pa
-    rho:      parseFloat(inputRho.value),
-    nu:       parseFloat(inputNu.value),
-    boundary: selectBoundary.value,
-    freq_max: parseFloat(inputFreqMax.value),
-    grid_n:   Math.min(100, Math.max(4, parseInt(inputGridN.value) || 60)),
+    lx:        parseFloat(inputLx.value) / 1000,
+    ly:        parseFloat(inputLy.value) / 1000,
+    h:         parseFloat(inputH.value)  / 1000,
+    ex:        parseFloat(inputEx.value) * 1e6,   // MPa → Pa
+    ey:        parseFloat(inputEy.value) * 1e6,
+    g:         parseFloat(inputG.value)  * 1e6,
+    nu:        parseFloat(inputNu.value),
+    rho:       parseFloat(inputRho.value),
+    boundary:  selectBoundary.value,
+    freq_max:  parseFloat(inputFreqMax.value),
+    grid_n:    Math.min(100, Math.max(4, parseInt(inputGridN.value) || 60)),
+    exciter_d: Math.max(0, parseFloat(inputExciterD.value) || 0) / 1000,
   };
+}
+
+// With "Isotropic" ticked, E_y and G follow from E_x and ν.
+function syncIsotropic() {
+  const iso = checkIsotropic.checked;
+  inputEy.disabled = iso;
+  inputG.disabled = iso;
+  if (iso) {
+    const ex = parseFloat(inputEx.value);
+    const nu = parseFloat(inputNu.value);
+    if (!isNaN(ex) && !isNaN(nu)) {
+      inputEy.value = String(ex);
+      inputG.value = String(Math.round((ex / (2 * (1 + nu))) * 100) / 100);
+    }
+  }
 }
 
 function setStatus(state: "calculating" | "done" | "error", msg: string) {
@@ -272,6 +331,7 @@ function setStatus(state: "calculating" | "done" | "error", msg: string) {
 }
 
 async function calculate() {
+  const id = ++requestId;
   setStatus("calculating", "Calculating…");
 
   const params = getParams();
@@ -280,7 +340,10 @@ async function calculate() {
     isNaN(params.lx) || params.lx <= 0 ||
     isNaN(params.ly) || params.ly <= 0 ||
     isNaN(params.h)  || params.h  <= 0 ||
-    isNaN(params.e)  || params.e  <= 0 ||
+    isNaN(params.ex) || params.ex <= 0 ||
+    isNaN(params.ey) || params.ey <= 0 ||
+    isNaN(params.g)  || params.g  <= 0 ||
+    isNaN(params.nu) || params.nu <  0 ||
     isNaN(params.rho)|| params.rho <= 0
   ) {
     setStatus("error", "Invalid parameters");
@@ -289,12 +352,38 @@ async function calculate() {
 
   try {
     const result: CalculationResult = await invoke("compute_heatmap", { params });
+    if (id !== requestId) return;
     lastResult = result;
+    lastParams = params;
     updateUI(result, params);
+    await loadSelectedShape();
+    if (id !== requestId) return;
     render();
-    setStatus("done", "Ready");
+    if (result.truncated_above !== null) {
+      setStatus("done", `Modes above ${Math.round(result.truncated_above)} Hz omitted (solver limit)`);
+    } else {
+      setStatus("done", "Ready");
+    }
   } catch (err) {
+    if (id !== requestId) return;
     setStatus("error", `Error: ${err}`);
+  }
+}
+
+// Fetches the shape of the selected mode for the node-line overlay.
+async function loadSelectedShape() {
+  if (selectedModeIdx < 0 || !lastParams) {
+    selectedShape = null;
+    return;
+  }
+  try {
+    selectedShape = await invoke("mode_shape", {
+      params: lastParams,
+      index: selectedModeIdx,
+      n: SHAPE_GRID_N,
+    });
+  } catch {
+    selectedShape = null;
   }
 }
 
@@ -316,9 +405,14 @@ function updateUI(result: CalculationResult, params: PanelParams) {
   valModes.textContent = String(result.mode_count);
   badgeModes.textContent = `${result.mode_count} modes`;
 
+  // Free-plate labels count node lines and are approximate; many modes mix
+  // several patterns.
+  const approx = params.boundary === "free" ? "≈" : "";
+  const label = (m: ModeInfo) => `${approx}(${m.m},${m.n})`;
+
   // Lowest frequency
   if (result.modes.length > 0) {
-    valF1.textContent = `${result.modes[0].freq.toFixed(1)} Hz  (${result.modes[0].m},${result.modes[0].n})`;
+    valF1.textContent = `${result.modes[0].freq.toFixed(1)} Hz  ${label(result.modes[0])}`;
   } else {
     valF1.textContent = "—";
   }
@@ -330,7 +424,7 @@ function updateUI(result: CalculationResult, params: PanelParams) {
     const m = result.modes[i];
     const opt = document.createElement("option");
     opt.value = String(i);
-    opt.textContent = `(${m.m},${m.n})  ${m.freq.toFixed(0)} Hz`;
+    opt.textContent = `${i + 1}. ${label(m)}  ${m.freq.toFixed(0)} Hz`;
     selectMode.appendChild(opt);
   }
   selectedModeIdx = prev < result.modes.length ? prev : -1;
@@ -386,7 +480,11 @@ canvas.addEventListener("mousemove", (e) => {
 
   valCursor.textContent = `${x.toFixed(1)} × ${y.toFixed(1)} mm`;
 
-  tooltip.textContent = `${x.toFixed(1)} × ${y.toFixed(1)} mm  ·  score ${(normScore * 100).toFixed(0)}%`;
+  const inMargin =
+    normX < lastResult.margin_x || normX > 1 - lastResult.margin_x ||
+    normY < lastResult.margin_y || normY > 1 - lastResult.margin_y;
+  const scoreText = inMargin ? "edge margin" : `score ${(normScore * 100).toFixed(0)}%`;
+  tooltip.textContent = `${x.toFixed(1)} × ${y.toFixed(1)} mm  ·  ${scoreText}`;
   tooltip.classList.add("visible");
 
   const rect = canvas.getBoundingClientRect();
@@ -404,24 +502,41 @@ canvas.addEventListener("mouseleave", () => {
 
 // ── Input listeners ───────────────────────────────────────────────────────────
 
-const numericInputs = [inputLx, inputLy, inputH, inputE, inputRho, inputNu, inputFreqMax, inputGridN];
+const numericInputs = [
+  inputLx, inputLy, inputH, inputEx, inputEy, inputG, inputRho, inputNu,
+  inputFreqMax, inputExciterD, inputGridN,
+];
 numericInputs.forEach((el) => el.addEventListener("input", scheduleCalculate));
+[inputEx, inputNu].forEach((el) => el.addEventListener("input", syncIsotropic));
+
+checkIsotropic.addEventListener("change", () => {
+  syncIsotropic();
+  scheduleCalculate();
+});
 
 selectBoundary.addEventListener("change", scheduleCalculate);
 
 selectMaterial.addEventListener("change", () => {
   const preset = MATERIALS[selectMaterial.value];
   if (preset) {
-    inputE.value   = String(preset.e);
+    inputEx.value  = String(preset.ex);
     inputRho.value = String(preset.rho);
     inputNu.value  = String(preset.nu);
+    checkIsotropic.checked = preset.ey === undefined;
+    if (preset.ey !== undefined && preset.g !== undefined) {
+      inputEy.value = String(preset.ey);
+      inputG.value  = String(preset.g);
+    }
+    syncIsotropic();
     scheduleCalculate();
   }
 });
 
-selectMode.addEventListener("change", () => {
+selectMode.addEventListener("change", async () => {
   selectedModeIdx = parseInt(selectMode.value);
-  render();
+  const id = requestId;
+  await loadSelectedShape();
+  if (id === requestId) render();
 });
 
 
@@ -432,5 +547,6 @@ resizeObserver.observe(canvasWrap);
 // ── Boot ──────────────────────────────────────────────────────────────────────
 
 window.addEventListener("DOMContentLoaded", () => {
+  syncIsotropic();
   calculate();
 });

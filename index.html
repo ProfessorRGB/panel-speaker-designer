@@ -59,13 +59,32 @@
             <option value="custom">Custom…</option>
           </select>
         </div>
+        <label class="checkbox-field">
+          <input type="checkbox" id="isotropic" checked/>
+          <span>Isotropic (same in every direction)</span>
+        </label>
         <div class="field">
-          <label for="e">Young's mod.</label>
+          <label for="ex" title="Young's modulus along the panel width (the grain direction for wood)">E along x</label>
           <div class="input-with-unit">
-            <input type="number" id="e" value="3200" min="0.1" max="500000" step="1"/>
+            <input type="number" id="ex" value="3200" min="0.1" max="500000" step="1"/>
             <span class="unit">MPa</span>
           </div>
         </div>
+        <div class="field">
+          <label for="ey" title="Young's modulus along the panel height (across the grain for wood)">E along y</label>
+          <div class="input-with-unit">
+            <input type="number" id="ey" value="3200" min="0.1" max="500000" step="1" disabled/>
+            <span class="unit">MPa</span>
+          </div>
+        </div>
+        <div class="field">
+          <label for="g" title="In-plane shear modulus; mainly sets the twisting modes">Shear G</label>
+          <div class="input-with-unit">
+            <input type="number" id="g" value="1168" min="0.01" max="200000" step="1" disabled/>
+            <span class="unit">MPa</span>
+          </div>
+        </div>
+        <div class="field-hint">x runs along the width. For wood, put the grain along x.</div>
         <div class="field">
           <label for="rho">Density</label>
           <div class="input-with-unit">
@@ -74,8 +93,8 @@
           </div>
         </div>
         <div class="field">
-          <label for="nu">Poisson's ν</label>
-          <input type="number" id="nu" value="0.37" min="0.01" max="0.49" step="0.01"/>
+          <label for="nu" title="Major Poisson's ratio ν_xy">Poisson's ν</label>
+          <input type="number" id="nu" value="0.37" min="0" max="0.6" step="0.01"/>
         </div>
       </section>
 
@@ -94,6 +113,13 @@
           <div class="input-with-unit">
             <input type="number" id="freq-max" value="5000" min="100" max="40000" step="100"/>
             <span class="unit">Hz</span>
+          </div>
+        </div>
+        <div class="field">
+          <label for="exciter-d" title="Voice-coil diameter. The exciter drives the panel around this ring, which averages out modes smaller than the coil. 0 = point drive.">Exciter Ø</label>
+          <div class="input-with-unit">
+            <input type="number" id="exciter-d" value="25" min="0" max="200" step="1"/>
+            <span class="unit">mm</span>
           </div>
         </div>
         <div class="field">
