@@ -32,22 +32,26 @@ pub struct Shape {
     pub holes: Vec<Path>,
 }
 
-/// The built-in panel shapes, each filling a width × height bounding box.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// Panel outlines, each filling a width × height bounding box.
+#[derive(Clone, Debug, PartialEq)]
 pub enum Panel {
     Rectangle,
     RoundedRectangle { radius: f64 },
     Ellipse,
     Polygon { sides: usize },
+    /// A user-drawn outline in normalised coordinates (0..1 across the box),
+    /// so it scales with the width and height.
+    Custom(Path),
 }
 
 impl Panel {
-    pub fn to_shape(self, w: f64, h: f64, cutouts: &[Cutout]) -> Shape {
+    pub fn to_shape(&self, w: f64, h: f64, cutouts: &[Cutout]) -> Shape {
         let outline = match self {
             Panel::Rectangle => Path::rectangle(0.0, 0.0, w, h),
-            Panel::RoundedRectangle { radius } => Path::rounded_rectangle(0.0, 0.0, w, h, radius),
+            Panel::RoundedRectangle { radius } => Path::rounded_rectangle(0.0, 0.0, w, h, *radius),
             Panel::Ellipse => Path::ellipse(0.0, 0.0, w, h),
-            Panel::Polygon { sides } => Path::regular_polygon(0.0, 0.0, w, h, sides),
+            Panel::Polygon { sides } => Path::regular_polygon(0.0, 0.0, w, h, *sides),
+            Panel::Custom(path) => path.scaled(w, h),
         };
         Shape { outline, holes: cutouts.iter().map(Cutout::to_path).collect() }
     }
@@ -141,6 +145,12 @@ impl Shape {
             path.flatten((size / 200.0).max(1e-5))
         };
         let outer = res(&self.outline);
+        if outer.len() >= 3 && self_intersects(&outer) {
+            return Err("The outline crosses itself".into());
+        }
+        if outer.len() < 3 || Outline::from_rings(vec![outer.clone()]).area().abs() < 1e-8 {
+            return Err("The outline needs at least three points enclosing an area".into());
+        }
         let outer_only = Outline::from_rings(vec![outer.clone()]);
         let rings: Vec<Vec<Pt>> = self.holes.iter().map(res).collect();
         for (i, ring) in rings.iter().enumerate() {
@@ -204,6 +214,33 @@ impl Shape {
         }
         Ok(())
     }
+}
+
+/// True if any two non-adjacent edges of a closed ring touch or cross.
+fn self_intersects(ring: &[Pt]) -> bool {
+    let n = ring.len();
+    let edge = |i: usize| (ring[i], ring[(i + 1) % n]);
+    // Sort edges by min x so only overlapping x-ranges are compared.
+    let mut order: Vec<usize> = (0..n).collect();
+    let min_x = |i: usize| edge(i).0[0].min(edge(i).1[0]);
+    let max_x = |i: usize| edge(i).0[0].max(edge(i).1[0]);
+    order.sort_by(|&a, &b| min_x(a).total_cmp(&min_x(b)));
+    for (k, &i) in order.iter().enumerate() {
+        for &j in &order[k + 1..] {
+            if min_x(j) > max_x(i) {
+                break;
+            }
+            let adjacent = (i + 1) % n == j || (j + 1) % n == i;
+            if !adjacent {
+                let (a, b) = edge(i);
+                let (c, d) = edge(j);
+                if segments_cross(a, b, c, d) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// True if two segments intersect or touch.
@@ -302,6 +339,17 @@ impl Path {
         }
     }
 
+    pub fn scaled(&self, sx: f64, sy: f64) -> Path {
+        let s = |p: Pt| [p[0] * sx, p[1] * sy];
+        Path {
+            start: s(self.start),
+            segments: self.segments.iter().map(|seg| match *seg {
+                Segment::Line { to } => Segment::Line { to: s(to) },
+                Segment::Cubic { c1, c2, to } => Segment::Cubic { c1: s(c1), c2: s(c2), to: s(to) },
+            }).collect(),
+        }
+    }
+
     /// Polygon approximation with no edge longer than `max_len` and curves
     /// followed to within `max_len / 50`. The closing point is not repeated.
     pub fn flatten(&self, max_len: f64) -> Vec<Pt> {
@@ -332,9 +380,9 @@ impl Path {
         }
         if dist(cur, self.start) > 1e-12 {
             push_line(&mut pts, cur, self.start, max_len);
-        } else {
-            pts.pop();
         }
+        // The ring is closed implicitly; don't repeat the start point.
+        pts.pop();
         pts.dedup_by(|a, b| dist(*a, *b) < 1e-12);
         pts
     }
@@ -436,7 +484,6 @@ impl Outline {
     }
 
     /// Material area (outline minus holes), by the shoelace formula.
-    #[cfg(test)]
     pub fn area(&self) -> f64 {
         let ring_area = |r: &Vec<Pt>| -> f64 {
             (0..r.len()).map(|i| {
@@ -517,6 +564,42 @@ mod tests {
         assert!(shape.validate_stiffeners(&[rib(0.02, 0.1, 0.28, 0.1)]).unwrap_err().contains("across a cutout"));
         assert!(shape.validate_stiffeners(&[rib(0.02, 0.05, 0.28, 0.05), rib(0.05, 0.02, 0.05, 0.18)])
             .unwrap_err().contains("crosses"));
+    }
+
+    #[test]
+    fn custom_outlines_scale_and_are_validated() {
+        // A normalised diamond scales to the box.
+        let diamond = Path {
+            start: [0.5, 0.0],
+            segments: vec![
+                Segment::Line { to: [1.0, 0.5] },
+                Segment::Line { to: [0.5, 1.0] },
+                Segment::Line { to: [0.0, 0.5] },
+            ],
+        };
+        let shape = Panel::Custom(diamond).to_shape(0.3, 0.2, &[]);
+        assert!(shape.validate(&[]).is_ok());
+        assert!((Outline::new(&shape, 0.01).area() - 0.03).abs() < 1e-12);
+        // A bow-tie crosses itself.
+        let bowtie = Path {
+            start: [0.0, 0.0],
+            segments: vec![
+                Segment::Line { to: [1.0, 1.0] },
+                Segment::Line { to: [1.0, 0.0] },
+                Segment::Line { to: [0.0, 1.0] },
+            ],
+        };
+        let err = Panel::Custom(bowtie).to_shape(0.3, 0.2, &[]).validate(&[]).unwrap_err();
+        assert!(err.contains("crosses itself"), "{err}");
+        // A curve looping back over a straight edge crosses it too.
+        let loopy = Path {
+            start: [0.0, 0.5],
+            segments: vec![
+                Segment::Line { to: [1.0, 0.5] },
+                Segment::Cubic { c1: [1.0, 1.0], c2: [-0.5, -0.5], to: [0.0, 0.5] },
+            ],
+        };
+        assert!(Panel::Custom(loopy).to_shape(0.3, 0.2, &[]).validate(&[]).is_err());
     }
 
     #[test]

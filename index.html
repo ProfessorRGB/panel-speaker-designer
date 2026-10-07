@@ -28,6 +28,7 @@
             <option value="rounded_rectangle">Rounded rectangle</option>
             <option value="ellipse">Ellipse / circle</option>
             <option value="polygon">Regular polygon</option>
+            <option value="custom">Custom (Bézier)</option>
           </select>
         </div>
         <div class="field">
@@ -201,6 +202,7 @@
           <span id="mode-count-badge" class="badge"></span>
         </div>
         <div class="toolbar-right">
+          <button type="button" id="edit-outline" class="toolbar-btn" hidden>Edit outline</button>
           <label class="toolbar-item">
             <span>Mode overlay</span>
             <select id="mode-select">
@@ -214,6 +216,7 @@
       <div class="canvas-wrap" id="canvas-wrap">
         <canvas id="heatmap"></canvas>
         <div id="hover-tooltip" class="hover-tooltip"></div>
+        <div id="outline-hint" class="outline-hint" hidden>Drag points and handles · double-click the outline to add a point · select a point and press Delete to remove it · Option-click a point to switch corner ↔ smooth · ⌘Z to undo · press Solve when done</div>
       </div>
 
       <!-- Charts -->

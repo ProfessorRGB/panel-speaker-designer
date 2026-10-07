@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { ModeDensityChart, ResponseChart, Series } from "./charts";
+import { Frame, OutlineEditor, anchorsFromShape, toPath } from "./outline-editor";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -19,6 +20,7 @@ interface PanelParams {
   shape: string;
   corner_r: number;
   sides: number;
+  custom_path: ReturnType<typeof toPath> | null;
   cutouts: Cutout[];
   stiffeners: StiffenerParams[];
   lx: number;
@@ -213,9 +215,10 @@ function getCanvasSize(lx: number, ly: number): { cw: number; ch: number; scale:
   };
 }
 
-function render() {
-  if (!lastResult) return;
+// The panel's pixel frame on the canvas, from the last render.
+let panelFrame: Frame | null = null;
 
+function render() {
   const lxMm = parseFloat(inputLx.value);
   const lyMm = parseFloat(inputLy.value);
   const { cw, ch, scale } = getCanvasSize(lxMm, lyMm);
@@ -230,6 +233,13 @@ function render() {
   const ph = Math.round(lyMm * scale);   // panel pixel height
   const ox = Math.round((cw - pw) / 2);  // panel offset x
   const oy = Math.round((ch - ph) / 2);
+  panelFrame = { ox, oy, pw, ph };
+
+  const custom = selectShape.value === "custom";
+  if (!lastResult) {
+    if (custom) editor.draw(ctx, panelFrame);
+    return;
+  }
 
   const { grid, grid_n, region, outline, optimal_x, optimal_y } = lastResult;
 
@@ -252,6 +262,8 @@ function render() {
   const display = fillOutside(grid, grid_n);
   ctx.save();
   ctx.clip(outlinePath, "evenodd");
+  // While editing the outline, the old result is only a backdrop.
+  ctx.globalAlpha = editor.active ? 0.3 : 1;
   for (let row = 0; row < grid_n; row++) {
     for (let col = 0; col < grid_n; col++) {
       const i = row * grid_n + col;
@@ -295,8 +307,11 @@ function render() {
   }
   ctx.restore();
 
+  // ── Custom outline (editor) ────────────────────────────────────────────────
+  if (custom) editor.draw(ctx, panelFrame);
+
   // ── Mode node lines ───────────────────────────────────────────────────────
-  if (selectedShape) {
+  if (selectedShape && !editor.active) {
     drawNodeLines(ctx, selectedShape, SHAPE_GRID_N, ox, oy, pw, ph);
   }
 
@@ -327,7 +342,7 @@ function render() {
   ctx.fill();
 
   // ── Clicked comparison position ───────────────────────────────────────────
-  if (probe) {
+  if (probe && !editor.active) {
     const px = ox + probe.x * pw;
     const py = oy + probe.y * ph;
     ctx.lineWidth = 4;
@@ -431,6 +446,7 @@ function getParams(): PanelParams {
     shape:     selectShape.value,
     corner_r:  Math.max(0, parseFloat(inputCornerR.value) || 0) / 1000,
     sides:     Math.min(64, Math.max(3, parseInt(inputSides.value) || 6)),
+    custom_path: selectShape.value === "custom" ? toPath(editor.anchors) : null,
     cutouts:   cutouts.map((c) => c.kind === "hole"
       ? { ...c, x: c.x / 1000, y: c.y / 1000, d: c.d / 1000 }
       : { ...c, x: c.x / 1000, y: c.y / 1000, length: c.length / 1000, width: c.width / 1000 }),
@@ -715,6 +731,10 @@ function canvasToPanel(
 }
 
 canvas.addEventListener("mousemove", (e) => {
+  if (editor.active) {
+    tooltip.classList.remove("visible");
+    return;
+  }
   const pos = canvasToPanel(e.clientX, e.clientY);
   if (!pos || !lastResult) {
     tooltip.classList.remove("visible");
@@ -755,6 +775,7 @@ canvas.addEventListener("mousemove", (e) => {
 });
 
 canvas.addEventListener("click", async (e) => {
+  if (editor.active) return;
   const pos = canvasToPanel(e.clientX, e.clientY);
   if (!pos || !lastParams || !lastResult) return;
   const n = lastResult.grid_n;
@@ -789,12 +810,35 @@ checkIsotropic.addEventListener("change", () => {
 
 selectBoundary.addEventListener("change", scheduleCalculate);
 
+// ── Custom outline ───────────────────────────────────────────────────────────
+
+const editor = new OutlineEditor(
+  canvas,
+  () => panelFrame,
+  () => scheduleCalculate(),
+  () => render(),
+);
+const editOutlineBtn = $("edit-outline") as HTMLButtonElement;
+
+// The last built-in shape, which a new custom outline starts from.
+let lastBuiltinShape = selectShape.value;
+
+function setEditing(on: boolean) {
+  editor.setActive(on);
+  editOutlineBtn.classList.toggle("active", on);
+  editOutlineBtn.textContent = on ? "Done editing" : "Edit outline";
+  $("outline-hint").hidden = !on;
+}
+editOutlineBtn.addEventListener("click", () => setEditing(!editor.active));
+
 // Shape-specific fields.
 function syncShapeFields() {
   const shape = selectShape.value;
   $("field-corner-r").hidden = shape !== "rounded_rectangle";
   $("field-sides").hidden = shape !== "polygon";
   $("shape-hint").hidden = shape === "rectangle";
+  editOutlineBtn.hidden = shape !== "custom";
+  if (shape !== "custom" && editor.active) setEditing(false);
 }
 /** A stiffener in SI units, with its material resolved. "Same as panel"
  *  takes the panel's stiffness along the rib's direction. */
@@ -991,6 +1035,19 @@ $("add-stiffener").addEventListener("click", () => {
 $("add-slot").addEventListener("click", () => addCutout("slot"));
 
 selectShape.addEventListener("change", () => {
+  if (selectShape.value === "custom") {
+    // Start from the shape that was showing, so nothing is drawn from scratch.
+    editor.setAnchors(anchorsFromShape(
+      lastBuiltinShape,
+      parseFloat(inputLx.value) || 300,
+      parseFloat(inputLy.value) || 200,
+      parseFloat(inputCornerR.value) || 0,
+      parseInt(inputSides.value) || 6,
+    ));
+    setEditing(true);
+  } else {
+    lastBuiltinShape = selectShape.value;
+  }
   syncShapeFields();
   probe = null;  // a clicked position may not be on the new shape
   scheduleCalculate();

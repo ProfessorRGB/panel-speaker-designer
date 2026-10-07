@@ -393,4 +393,17 @@ mod tests {
         let nearest = model.modes.iter().map(|m| m.freq).min_by(|a, b| (a - expected).abs().total_cmp(&(b - expected).abs())).unwrap();
         assert!((nearest - expected).abs() / expected < 0.04, "FEA {nearest:.1} Hz vs beam theory {expected:.1} Hz");
     }
+
+    #[test]
+    fn custom_outline_matches_equivalent_builtin() {
+        use crate::geometry::Path;
+        let p = acrylic(0.3, 0.2);
+        let builtin = Model::solve(ModelKey::for_freq(p, Boundary::Free, Panel::Ellipse, vec![], vec![], 1000.0)).unwrap();
+        let custom = Panel::Custom(Path::ellipse(0.0, 0.0, 1.0, 1.0));
+        let drawn = Model::solve(ModelKey::for_freq(p, Boundary::Free, custom, vec![], vec![], 1000.0)).unwrap();
+        assert_eq!(builtin.modes.len(), drawn.modes.len());
+        for (a, b) in builtin.modes.iter().zip(&drawn.modes) {
+            assert!((a.freq - b.freq).abs() / a.freq < 1e-6, "{} vs {}", a.freq, b.freq);
+        }
+    }
 }

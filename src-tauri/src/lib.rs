@@ -5,7 +5,7 @@ mod model;
 mod plate;
 mod response;
 
-use geometry::{Cutout, Panel, Pt, Stiffener};
+use geometry::{Cutout, Panel, Path, Pt, Stiffener};
 use model::{Discretisation, Model, ModelKey};
 use nalgebra::DMatrix;
 use plate::{Boundary, Plate};
@@ -19,6 +19,8 @@ pub struct PanelParams {
     pub shape: String,    // "rectangle" | "rounded_rectangle" | "ellipse" | "polygon"
     pub corner_r: f64,    // rounded-rectangle corner radius [m]
     pub sides: usize,     // polygon side count
+    #[serde(default)]
+    pub custom_path: Option<Path>,  // "custom" outline, normalised to the box
     #[serde(default)]
     pub cutouts: Vec<Cutout>,  // holes and slots, positions in metres
     #[serde(default)]
@@ -106,6 +108,7 @@ impl PanelParams {
             "rounded_rectangle" => Panel::RoundedRectangle { radius: self.corner_r },
             "ellipse" => Panel::Ellipse,
             "polygon" => Panel::Polygon { sides: self.sides.clamp(3, 64) },
+            "custom" => Panel::Custom(self.custom_path.clone().ok_or("No custom outline was given")?),
             other => return Err(format!("Unknown shape: {other}")),
         };
         // Resolve modes somewhat above freq_max, so the response near the top
@@ -465,7 +468,7 @@ mod tests {
 
     fn params() -> PanelParams {
         PanelParams {
-            shape: "ellipse".into(), corner_r: 0.0, sides: 6, cutouts: vec![], stiffeners: vec![],
+            shape: "ellipse".into(), corner_r: 0.0, sides: 6, custom_path: None, cutouts: vec![], stiffeners: vec![],
             lx: 0.3, ly: 0.2, h: 0.003, ex: 3.2e9, ey: 3.2e9, g: 3.2e9 / 2.74, nu: 0.37, rho: 1190.0,
             boundary: "free".into(), freq_max: 5000.0, grid_n: 60, exciter_d: 0.025, eta: 0.04, score: "flatness".into(),
         }

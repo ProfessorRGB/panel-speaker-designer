@@ -409,6 +409,40 @@ select:focus {
   border-color: var(--input-focus);
 }
 
+/* Outline editor */
+
+.toolbar-btn {
+  background: var(--input-bg);
+  border: 1px solid var(--input-border);
+  border-radius: var(--radius);
+  color: var(--text);
+  font: inherit;
+  font-size: 11px;
+  padding: 3px 10px;
+  cursor: pointer;
+}
+
+.toolbar-btn.active {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.outline-hint {
+  position: absolute;
+  top: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: calc(100% - 32px);
+  background: rgba(0,0,0,0.75);
+  border: 1px solid #444;
+  border-radius: var(--radius);
+  padding: 4px 10px;
+  font-size: 11px;
+  color: #ddd;
+  text-align: center;
+  pointer-events: none;
+}
+
 /* Charts */
 
 .chart-panel {
