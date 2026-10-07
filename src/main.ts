@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { ModeDensityChart, ResponseChart, Series } from "./charts";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -15,6 +16,8 @@ interface PanelParams {
   freq_max: number;
   grid_n: number;
   exciter_d: number;
+  eta: number;
+  score: string;
 }
 
 interface ModeInfo {
@@ -25,6 +28,7 @@ interface ModeInfo {
 
 interface CalculationResult {
   grid: number[];
+  grid_raw: number[];
   grid_n: number;
   modes: ModeInfo[];
   mode_count: number;
@@ -33,30 +37,38 @@ interface CalculationResult {
   optimal_score_raw: number;
   margin_x: number;
   margin_y: number;
+  bands: number[];
+  response_opt: number[];
+  raggedness_opt: number;
   truncated_above: number | null;
 }
 
 // ── Material presets ─────────────────────────────────────────────────────────
 // Moduli in MPa. Isotropic presets derive E_y and G from E_x and ν.
 // Wood values are typical; real sheets vary widely, so measure if you can.
+// Loss factors are for bare panels; mounting and surrounds add damping.
 
 interface Material {
   ex: number;
   rho: number;
   nu: number;
+  eta: number;
   ey?: number;  // set for orthotropic materials
   g?: number;
 }
 
 const MATERIALS: Record<string, Material> = {
-  xps:      { ex: 20,    rho: 32,   nu: 0.35 },                     // XPS foam
-  eps:      { ex: 5,     rho: 20,   nu: 0.10 },                     // EPS foam
-  balsa:    { ex: 3000,  rho: 130,  nu: 0.30, ey: 90,   g: 120 },   // Balsa, grain along x
-  birch:    { ex: 10000, rho: 680,  nu: 0.07, ey: 5500, g: 620 },   // Birch plywood, face grain along x
-  acrylic:  { ex: 3200,  rho: 1190, nu: 0.37 },                     // PMMA
-  aluminum: { ex: 69000, rho: 2700, nu: 0.33 },                     // Aluminium
-  carbon:   { ex: 70000, rho: 1600, nu: 0.10 },                     // CFRP, quasi-isotropic estimate
+  xps:      { ex: 20,    rho: 32,   nu: 0.35, eta: 0.05 },                     // XPS foam
+  eps:      { ex: 5,     rho: 20,   nu: 0.10, eta: 0.06 },                     // EPS foam
+  balsa:    { ex: 3000,  rho: 130,  nu: 0.30, eta: 0.03, ey: 90,   g: 120 },   // Balsa, grain along x
+  birch:    { ex: 10000, rho: 680,  nu: 0.07, eta: 0.03, ey: 5500, g: 620 },   // Birch plywood, face grain along x
+  acrylic:  { ex: 3200,  rho: 1190, nu: 0.37, eta: 0.04 },                     // PMMA
+  aluminum: { ex: 69000, rho: 2700, nu: 0.33, eta: 0.005 },                    // Aluminium
+  carbon:   { ex: 70000, rho: 1600, nu: 0.10, eta: 0.01 },                     // CFRP, quasi-isotropic estimate
 };
+
+// Matches the "clicked position" series colour in the response chart.
+const PROBE_COLOR = "#d95926";
 
 // Resolution of the mode shape used to trace node lines.
 const SHAPE_GRID_N = 120;
@@ -69,6 +81,10 @@ let selectedModeIdx = -1;
 let selectedShape: number[] | null = null;
 let calcTimer: ReturnType<typeof setTimeout> | null = null;
 let requestId = 0;  // newer calculations supersede older in-flight ones
+
+// A position the user clicked, to compare its response with the optimum.
+interface Probe { x: number; y: number; db: number[]; raggedness: number }
+let probe: Probe | null = null;
 
 // ── DOM refs ─────────────────────────────────────────────────────────────────
 
@@ -87,6 +103,8 @@ const selectMaterial = $("material-preset") as HTMLSelectElement;
 const selectBoundary = $("boundary")   as HTMLSelectElement;
 const inputFreqMax   = $("freq-max")   as HTMLInputElement;
 const inputExciterD  = $("exciter-d")  as HTMLInputElement;
+const inputEta       = $("eta")        as HTMLInputElement;
+const selectScore    = $("score")      as HTMLSelectElement;
 const inputGridN     = $("grid-n")     as HTMLInputElement;
 const selectMode     = $("mode-select") as HTMLSelectElement;
 
@@ -99,6 +117,13 @@ const valOptimal     = $("val-optimal");
 const valCursor      = $("val-cursor");
 const valModes       = $("val-modes");
 const valF1          = $("val-f1");
+const valRagged      = $("val-ragged");
+const responseLegend = $("response-legend");
+const densityGaps    = $("density-gaps");
+const chartTooltip   = $("chart-tooltip");
+
+const responseChart = new ResponseChart($("response-chart") as HTMLCanvasElement, chartTooltip);
+const densityChart  = new ModeDensityChart($("density-chart") as HTMLCanvasElement, chartTooltip);
 
 // ── Colormap ─────────────────────────────────────────────────────────────────
 // Perceptual: dark-blue → blue → teal → green → yellow → red
@@ -233,6 +258,20 @@ function render() {
   ctx.arc(optPx, optPy, 2.5, 0, Math.PI * 2);
   ctx.fill();
 
+  // ── Clicked comparison position ───────────────────────────────────────────
+  if (probe) {
+    const px = ox + probe.x * pw;
+    const py = oy + probe.y * ph;
+    ctx.lineWidth = 4;
+    ctx.strokeStyle = "rgba(0,0,0,0.6)";
+    ctx.beginPath();
+    ctx.arc(px, py, 7, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = PROBE_COLOR;
+    ctx.stroke();
+  }
+
   // ── Dimension labels ──────────────────────────────────────────────────────
   ctx.fillStyle = "rgba(180,180,180,0.7)";
   ctx.font = `10px ${getComputedStyle(document.documentElement).getPropertyValue("--mono").trim() || "monospace"}`;
@@ -307,6 +346,8 @@ function getParams(): PanelParams {
     freq_max:  parseFloat(inputFreqMax.value),
     grid_n:    Math.min(100, Math.max(4, parseInt(inputGridN.value) || 60)),
     exciter_d: Math.max(0, parseFloat(inputExciterD.value) || 0) / 1000,
+    eta:       parseFloat(inputEta.value),
+    score:     selectScore.value,
   };
 }
 
@@ -344,6 +385,7 @@ async function calculate() {
     isNaN(params.ey) || params.ey <= 0 ||
     isNaN(params.g)  || params.g  <= 0 ||
     isNaN(params.nu) || params.nu <  0 ||
+    isNaN(params.eta)|| params.eta <= 0 ||
     isNaN(params.rho)|| params.rho <= 0
   ) {
     setStatus("error", "Invalid parameters");
@@ -356,9 +398,10 @@ async function calculate() {
     lastResult = result;
     lastParams = params;
     updateUI(result, params);
-    await loadSelectedShape();
+    await Promise.all([loadSelectedShape(), loadProbe()]);
     if (id !== requestId) return;
     render();
+    updateCharts();
     if (result.truncated_above !== null) {
       setStatus("done", `Modes above ${Math.round(result.truncated_above)} Hz omitted (solver limit)`);
     } else {
@@ -387,6 +430,56 @@ async function loadSelectedShape() {
   }
 }
 
+// Recomputes the clicked position's response for the current parameters.
+async function loadProbe() {
+  if (!probe || !lastParams) return;
+  try {
+    const curve: { db: number[]; raggedness: number } =
+      await invoke("response_at", { params: lastParams, x: probe.x, y: probe.y });
+    probe.db = curve.db;
+    probe.raggedness = curve.raggedness;
+  } catch {
+    probe = null;
+  }
+}
+
+function updateCharts() {
+  if (!lastResult || !lastParams) return;
+  const { bands, response_opt, raggedness_opt, modes } = lastResult;
+
+  // Levels are relative: 0 dB is the mean of the optimal position's response.
+  const ref = response_opt.length
+    ? response_opt.reduce((a, b) => a + b, 0) / response_opt.length
+    : 0;
+  const series: Series[] = [{
+    label: "Best position",
+    color: "series1",
+    values: response_opt.map((v) => v - ref),
+  }];
+  if (probe && probe.db.length === bands.length) {
+    series.push({ label: "Clicked position", color: "series2", values: probe.db.map((v) => v - ref) });
+  }
+  responseChart.set(bands, series);
+
+  const key = (color: string, text: string) =>
+    `<span><span class="chart-swatch" style="background:${color}"></span>${text}</span>`;
+  responseLegend.innerHTML =
+    key("#3987e5", `Best ±${raggedness_opt.toFixed(1)} dB`) +
+    (probe
+      ? key(PROBE_COLOR, `Clicked ±${probe.raggedness.toFixed(1)} dB`) + '<button id="clear-probe">Clear</button>'
+      : "<span>Click the heat map to compare a position</span>");
+  document.getElementById("clear-probe")?.addEventListener("click", () => {
+    probe = null;
+    render();
+    updateCharts();
+  });
+
+  const gaps = densityChart.set(modes.map((m) => m.freq), lastParams.freq_max);
+  densityGaps.textContent = gaps === 0
+    ? "No empty bands"
+    : `${gaps} empty band${gaps === 1 ? "" : "s"}`;
+}
+
 function scheduleCalculate() {
   if (calcTimer) clearTimeout(calcTimer);
   calcTimer = setTimeout(calculate, 250);
@@ -403,6 +496,7 @@ function updateUI(result: CalculationResult, params: PanelParams) {
 
   // Mode count
   valModes.textContent = String(result.mode_count);
+  valRagged.textContent = result.bands.length ? `±${result.raggedness_opt.toFixed(1)} dB` : "—";
   badgeModes.textContent = `${result.mode_count} modes`;
 
   // Free-plate labels count node lines and are approximate; many modes mix
@@ -483,7 +577,12 @@ canvas.addEventListener("mousemove", (e) => {
   const inMargin =
     normX < lastResult.margin_x || normX > 1 - lastResult.margin_x ||
     normY < lastResult.margin_y || normY > 1 - lastResult.margin_y;
-  const scoreText = inMargin ? "edge margin" : `score ${(normScore * 100).toFixed(0)}%`;
+  const raw = lastResult.grid_raw[row * grid_n + col];
+  const scoreText = inMargin
+    ? "edge margin"
+    : lastParams?.score === "coupling"
+      ? `score ${(normScore * 100).toFixed(0)}%`
+      : `raggedness ±${raw.toFixed(1)} dB`;
   tooltip.textContent = `${x.toFixed(1)} × ${y.toFixed(1)} mm  ·  ${scoreText}`;
   tooltip.classList.add("visible");
 
@@ -495,6 +594,17 @@ canvas.addEventListener("mousemove", (e) => {
   tooltip.style.top  = `${ty}px`;
 });
 
+canvas.addEventListener("click", async (e) => {
+  const pos = canvasToPanel(e.clientX, e.clientY);
+  if (!pos || !lastParams) return;
+  probe = { x: pos.normX, y: pos.normY, db: [], raggedness: 0 };
+  const id = requestId;
+  await loadProbe();
+  if (id !== requestId) return;
+  render();
+  updateCharts();
+});
+
 canvas.addEventListener("mouseleave", () => {
   tooltip.classList.remove("visible");
   valCursor.textContent = "—";
@@ -504,7 +614,7 @@ canvas.addEventListener("mouseleave", () => {
 
 const numericInputs = [
   inputLx, inputLy, inputH, inputEx, inputEy, inputG, inputRho, inputNu,
-  inputFreqMax, inputExciterD, inputGridN,
+  inputFreqMax, inputExciterD, inputEta, inputGridN,
 ];
 numericInputs.forEach((el) => el.addEventListener("input", scheduleCalculate));
 [inputEx, inputNu].forEach((el) => el.addEventListener("input", syncIsotropic));
@@ -515,6 +625,7 @@ checkIsotropic.addEventListener("change", () => {
 });
 
 selectBoundary.addEventListener("change", scheduleCalculate);
+selectScore.addEventListener("change", scheduleCalculate);
 
 selectMaterial.addEventListener("change", () => {
   const preset = MATERIALS[selectMaterial.value];
@@ -522,6 +633,7 @@ selectMaterial.addEventListener("change", () => {
     inputEx.value  = String(preset.ex);
     inputRho.value = String(preset.rho);
     inputNu.value  = String(preset.nu);
+    inputEta.value = String(preset.eta);
     checkIsotropic.checked = preset.ey === undefined;
     if (preset.ey !== undefined && preset.g !== undefined) {
       inputEy.value = String(preset.ey);
@@ -543,6 +655,11 @@ selectMode.addEventListener("change", async () => {
 // Resize: re-render without recalculating
 const resizeObserver = new ResizeObserver(() => render());
 resizeObserver.observe(canvasWrap);
+const chartObserver = new ResizeObserver(() => {
+  responseChart.draw();
+  densityChart.draw();
+});
+chartObserver.observe($("chart-panel"));
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
 

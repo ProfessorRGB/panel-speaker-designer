@@ -1,6 +1,9 @@
 mod plate;
+mod response;
 
-use plate::{Boundary, GridBasis, Plate, SolveKey, Solution};
+use nalgebra::DMatrix;
+use plate::{Boundary, GridBasis, PointBasis, Plate, SolveKey, Solution};
+use response::Bands;
 use serde::{Deserialize, Serialize};
 use std::f64::consts::PI;
 use std::sync::{Arc, Mutex};
@@ -19,6 +22,8 @@ pub struct PanelParams {
     pub freq_max: f64,    // upper frequency limit [Hz]
     pub grid_n: usize,    // heat-map grid resolution (N×N)
     pub exciter_d: f64,   // exciter voice-coil diameter [m]; 0 = point drive
+    pub eta: f64,         // damping loss factor
+    pub score: String,    // "flatness" | "coupling"
 }
 
 #[derive(Serialize, Clone)]
@@ -30,9 +35,12 @@ pub struct ModeInfo {
 
 #[derive(Serialize)]
 pub struct CalculationResult {
-    // Row-major NxN, normalised so the interior search region spans [0, 1];
-    // cells inside the edge margin can exceed 1.
+    // Row-major NxN, normalised so the interior search region spans [0, 1]
+    // with 1 = best; cells inside the edge margin can fall outside that range.
     pub grid: Vec<f64>,
+    // The same cells in the score's own units: raggedness in dB (lower is
+    // better) or summed coupling (higher is better).
+    pub grid_raw: Vec<f64>,
     pub grid_n: usize,
     pub modes: Vec<ModeInfo>,
     pub mode_count: usize,
@@ -41,6 +49,9 @@ pub struct CalculationResult {
     pub optimal_score_raw: f64,
     pub margin_x: f64,       // edge margin excluded from the search, normalised
     pub margin_y: f64,
+    pub bands: Vec<f64>,         // response band centres [Hz]
+    pub response_opt: Vec<f64>,  // response at the optimal position [dB]
+    pub raggedness_opt: f64,     // its raggedness [dB]
     // Set when the solver could not resolve modes all the way to freq_max;
     // modes above this frequency are omitted.
     pub truncated_above: Option<f64>,
@@ -67,7 +78,75 @@ impl PanelParams {
             "simply_supported" => Boundary::SimplySupported,
             other => return Err(format!("Unknown boundary condition: {other}")),
         };
-        Ok(SolveKey::for_freq(plate, boundary, self.freq_max))
+        // Resolve modes somewhat above freq_max, so the response near the top
+        // of the band includes the tails of the modes just beyond it.
+        Ok(SolveKey::for_freq(plate, boundary, self.freq_max * RESPONSE_HEADROOM))
+    }
+
+    fn margins(&self) -> (f64, f64) {
+        // Optimal search excludes a 10% edge margin (widened if needed to keep
+        // the whole exciter on the panel). Free edges always move a lot, and
+        // edges and corners are impractical mounting locations.
+        const EDGE_MARGIN: f64 = 0.10;
+        let radius = self.exciter_d.max(0.0) / 2.0;
+        (EDGE_MARGIN.max(radius / self.lx), EDGE_MARGIN.max(radius / self.ly))
+    }
+}
+
+const RESPONSE_HEADROOM: f64 = 1.3;
+
+/// Everything needed to evaluate the response at any exciter position.
+struct ResponseModel<'a> {
+    modes: &'a [plate::Mode],
+    bands: Bands,
+    transfer: DMatrix<f64>,  // modes × bands
+}
+
+impl<'a> ResponseModel<'a> {
+    fn new(sol: &'a Solution, params: &PanelParams) -> ResponseModel<'a> {
+        let count = sol.modes.partition_point(|m| m.freq <= params.freq_max * RESPONSE_HEADROOM);
+        let modes = &sol.modes[..count];
+        // From just below the first mode to freq_max, or lower if the solver
+        // ran out of resolution.
+        let f_start = modes.first().map_or(params.freq_max, |m| m.freq * 2f64.powf(-1.0 / 24.0));
+        let f_end = params.freq_max.min(sol.freq_limit / RESPONSE_HEADROOM);
+        let bands = Bands::new(f_start, f_end);
+        let freqs: Vec<f64> = modes.iter().map(|m| m.freq).collect();
+        let transfer = response::transfer(&freqs, params.eta, &bands);
+        ResponseModel { modes, bands, transfer }
+    }
+
+    /// Response (dB) for an exciter with the given modal couplings.
+    fn curve(&self, couplings: &[f64]) -> Vec<f64> {
+        let power: Vec<f64> = (0..self.bands.len())
+            .map(|b| couplings.iter().enumerate().map(|(k, c)| c * c * self.transfer[(k, b)]).sum())
+            .collect();
+        response::to_db(&power)
+    }
+
+    /// Response at a normalised panel position, evaluating mode shapes exactly
+    /// around the voice-coil ring rather than interpolating the grid.
+    fn curve_at(&self, sol: &Solution, params: &PanelParams, x: f64, y: f64) -> Vec<f64> {
+        let radius = params.exciter_d.max(0.0) / 2.0;
+        let points: Vec<(f64, f64)> = if radius > 0.0 {
+            (0..RING_POINTS).map(|k| {
+                let theta = 2.0 * PI * k as f64 / RING_POINTS as f64;
+                (
+                    (x + radius * theta.cos() / params.lx).clamp(0.0, 1.0),
+                    (y + radius * theta.sin() / params.ly).clamp(0.0, 1.0),
+                )
+            }).collect()
+        } else {
+            vec![(x, y)]
+        };
+        let basis = PointBasis::new(sol, points);
+        let couplings: Vec<f64> = self.modes.iter()
+            .map(|m| {
+                let w = basis.eval(sol, m);
+                w.iter().sum::<f64>() / w.len() as f64
+            })
+            .collect();
+        self.curve(&couplings)
     }
 }
 
@@ -131,20 +210,15 @@ fn compute_heatmap(params: PanelParams) -> Result<CalculationResult, String> {
     let mode_count = modes.len();
     let n = params.grid_n.clamp(4, 100);
     let truncated_above = (sol.freq_limit < params.freq_max).then_some(sol.freq_limit);
-
-    // Optimal search excludes a 10% edge margin (widened if needed to keep the
-    // whole exciter on the panel). Free edges always move a lot, and edges and
-    // corners are impractical mounting locations.
-    const EDGE_MARGIN: f64 = 0.10;
-    let radius = params.exciter_d.max(0.0) / 2.0;
-    let margin_x = EDGE_MARGIN.max(radius / params.lx);
-    let margin_y = EDGE_MARGIN.max(radius / params.ly);
+    let (margin_x, margin_y) = params.margins();
+    let flatness = params.score != "coupling";
 
     let mode_infos = modes.iter().map(|m| ModeInfo { m: m.m, n: m.n, freq: m.freq }).collect();
 
     if mode_count == 0 {
         return Ok(CalculationResult {
             grid: vec![0.0; n * n],
+            grid_raw: vec![0.0; n * n],
             grid_n: n,
             modes: mode_infos,
             mode_count: 0,
@@ -153,23 +227,44 @@ fn compute_heatmap(params: PanelParams) -> Result<CalculationResult, String> {
             optimal_score_raw: 0.0,
             margin_x,
             margin_y,
+            bands: Vec::new(),
+            response_opt: Vec::new(),
+            raggedness_opt: 0.0,
             truncated_above,
         });
     }
 
-    // --- Score every grid cell ---
-    // Coupling to a mode is its displacement averaged over the voice-coil ring;
-    // the score is the sum of |coupling| over all modes.
+    // --- Couplings: each mode's shape averaged around the voice-coil ring ---
+    let model = ResponseModel::new(&sol, &params);
+    let radius = params.exciter_d.max(0.0) / 2.0;
     let stencil = ring_stencil(n, radius / params.lx, radius / params.ly);
     let basis = GridBasis::new(&sol, n);
-    let mut grid = vec![0.0f64; n * n];
-    for mode in modes {
+    let mut couplings = DMatrix::<f64>::zeros(n * n, model.modes.len());
+    for (k, mode) in model.modes.iter().enumerate() {
         let shape = basis.eval(&sol, mode);
-        for (cell, taps) in grid.iter_mut().zip(&stencil) {
-            let coupling: f64 = taps.iter().map(|&(i, w)| w * shape[i]).sum();
-            *cell += coupling.abs();
+        for (cell, taps) in stencil.iter().enumerate() {
+            couplings[(cell, k)] = taps.iter().map(|&(i, w)| w * shape[i]).sum();
         }
     }
+
+    // --- Score every grid cell ---
+    // Flatness: raggedness of the damped response (lower is better).
+    // Coupling: sum of |coupling| over modes up to freq_max (higher is better).
+    let grid_raw: Vec<f64> = if flatness {
+        let power = couplings.map(|c| c * c) * &model.transfer;  // cells × bands
+        (0..n * n)
+            .map(|cell| {
+                let row: Vec<f64> = power.row(cell).iter().copied().collect();
+                response::raggedness(&response::to_db(&row))
+            })
+            .collect()
+    } else {
+        (0..n * n)
+            .map(|cell| (0..mode_count).map(|k| couplings[(cell, k)].abs()).sum())
+            .collect()
+    };
+    // Higher is better for the search and the colour scale.
+    let goodness = |raw: f64| if flatness { -raw } else { raw };
 
     // The colour range comes from the interior only: free edges move far more
     // than anywhere an exciter can go, and would otherwise flatten the interior.
@@ -178,12 +273,14 @@ fn compute_heatmap(params: PanelParams) -> Result<CalculationResult, String> {
     let mut opt_x = 0.5f64;
     let mut opt_y = 0.5f64;
     let mut opt_score = f64::NEG_INFINITY;
+    let mut opt_raw = 0.0;
 
     for row in 0..n {
         let norm_y = (row as f64 + 0.5) / n as f64;
         for col in 0..n {
             let norm_x = (col as f64 + 0.5) / n as f64;
-            let score = grid[row * n + col];
+            let raw = grid_raw[row * n + col];
+            let score = goodness(raw);
 
             let interior = norm_x >= margin_x && norm_x <= 1.0 - margin_x
                         && norm_y >= margin_y && norm_y <= 1.0 - margin_y;
@@ -195,6 +292,7 @@ fn compute_heatmap(params: PanelParams) -> Result<CalculationResult, String> {
             min_score = min_score.min(score);
             if score > opt_score {
                 opt_score = score;
+                opt_raw = raw;
                 opt_x = norm_x;
                 opt_y = norm_y;
             }
@@ -203,24 +301,45 @@ fn compute_heatmap(params: PanelParams) -> Result<CalculationResult, String> {
 
     // Normalise to [0, 1]
     let range = max_score - min_score;
-    if range.is_finite() && range > 1e-12 {
-        for v in &mut grid {
-            *v = (*v - min_score) / range;
-        }
-    }
+    let grid = grid_raw.iter()
+        .map(|&raw| if range.is_finite() && range > 1e-12 { (goodness(raw) - min_score) / range } else { 0.5 })
+        .collect();
+
+    let response_opt = model.curve_at(&sol, &params, opt_x, opt_y);
+    let raggedness_opt = response::raggedness(&response_opt);
 
     Ok(CalculationResult {
         grid,
+        grid_raw,
         grid_n: n,
         modes: mode_infos,
         mode_count,
         optimal_x: opt_x,
         optimal_y: opt_y,
-        optimal_score_raw: opt_score,
+        optimal_score_raw: opt_raw,
         margin_x,
         margin_y,
+        bands: model.bands.centres.clone(),
+        response_opt,
+        raggedness_opt,
         truncated_above,
     })
+}
+
+#[derive(Serialize)]
+pub struct ResponseCurve {
+    pub db: Vec<f64>,       // per band, same bands as compute_heatmap
+    pub raggedness: f64,    // [dB]
+}
+
+/// Response with the exciter at a normalised panel position (x, y in 0..1).
+#[tauri::command(async)]
+fn response_at(params: PanelParams, x: f64, y: f64) -> Result<ResponseCurve, String> {
+    let sol = solve_cached(params.key()?);
+    let model = ResponseModel::new(&sol, &params);
+    let db = model.curve_at(&sol, &params, x.clamp(0.0, 1.0), y.clamp(0.0, 1.0));
+    let raggedness = response::raggedness(&db);
+    Ok(ResponseCurve { db, raggedness })
 }
 
 /// Shape of mode `index` (in the order `compute_heatmap` returned) sampled on
@@ -238,7 +357,7 @@ fn mode_shape(params: PanelParams, index: usize, n: usize) -> Result<Vec<f64>, S
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![compute_heatmap, mode_shape])
+        .invoke_handler(tauri::generate_handler![compute_heatmap, mode_shape, response_at])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

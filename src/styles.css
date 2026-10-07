@@ -332,6 +332,96 @@ select:focus {
 
 /* Info bar */
 
+/* Charts */
+
+.chart-panel {
+  position: relative;
+  height: 200px;
+  min-height: 200px;
+  display: grid;
+  grid-template-columns: 3fr 2fr;
+  gap: 1px;
+  background: var(--info-border);
+  border-top: 1px solid var(--info-border);
+}
+
+.chart-card {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  background: var(--info-bg);
+  padding: 8px 10px 4px;
+}
+
+.chart-header {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-height: 16px;
+}
+
+.chart-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.chart-subtitle,
+.chart-legend {
+  font-size: 10px;
+  font-family: var(--mono);
+  color: var(--muted);
+}
+
+.chart-legend {
+  margin-left: auto;
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+
+.chart-legend button {
+  background: none;
+  border: none;
+  color: var(--accent);
+  font: inherit;
+  cursor: pointer;
+  padding: 0;
+}
+
+.chart-swatch {
+  display: inline-block;
+  width: 12px;
+  height: 2px;
+  border-radius: 1px;
+  margin-right: 5px;
+  vertical-align: middle;
+}
+
+/* The canvas backing store is sized at device pixel ratio, so the canvas
+   must not take its CSS size from it: pin it to a flexible container. */
+.chart-plot {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+}
+
+.chart-plot canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+.chart-tooltip {
+  white-space: normal;
+  line-height: 1.5;
+}
+
+.chart-tip-title {
+  color: var(--muted);
+}
+
 .info-bar {
   height: 44px;
   min-height: 44px;

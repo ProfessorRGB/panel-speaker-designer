@@ -409,6 +409,48 @@ impl GridBasis {
     }
 }
 
+/// Precomputed basis tables for evaluating many modes at the same scattered
+/// points, given in normalised panel coordinates (0..1, 0..1).
+pub struct PointBasis {
+    points: Vec<(f64, f64)>,
+    tx: Vec<Vec<f64>>,
+    ty: Vec<Vec<f64>>,
+}
+
+impl PointBasis {
+    pub fn new(sol: &Solution, points: Vec<(f64, f64)>) -> PointBasis {
+        let (tx, ty) = match sol.key.boundary {
+            Boundary::Free => {
+                let xs: Vec<f64> = points.iter().map(|p| 2.0 * p.0 - 1.0).collect();
+                let ys: Vec<f64> = points.iter().map(|p| 2.0 * p.1 - 1.0).collect();
+                (legendre_table(sol.key.nx, &xs).val, legendre_table(sol.key.ny, &ys).val)
+            }
+            Boundary::SimplySupported => (Vec::new(), Vec::new()),
+        };
+        PointBasis { points, tx, ty }
+    }
+
+    pub fn eval(&self, sol: &Solution, mode: &Mode) -> Vec<f64> {
+        match &mode.shape {
+            Shape::Sine { m, n } => self.points.iter()
+                .map(|(x, y)| (*m as f64 * PI * x).sin() * (*n as f64 * PI * y).sin())
+                .collect(),
+            Shape::Legendre { px, py, coeffs } => {
+                let xi = parity_indices(sol.key.nx, *px);
+                let yi = parity_indices(sol.key.ny, *py);
+                (0..self.points.len()).map(|p| {
+                    xi.iter().enumerate().map(|(a, &i)| {
+                        let inner: f64 = yi.iter().enumerate()
+                            .map(|(b, &j)| coeffs[a * yi.len() + b] * self.ty[j][p])
+                            .sum();
+                        inner * self.tx[i][p]
+                    }).sum()
+                }).collect()
+            }
+        }
+    }
+}
+
 // w[row][col] = Σ_i Σ_j c_ij · φ_i(x_col) · ψ_j(y_row), computed as two
 // matrix products so cost is O(n·Nx·Ny + n²·Ny) rather than O(n²·Nx·Ny).
 fn separable_eval(

@@ -24,7 +24,9 @@ The panel is a thin (Kirchhoff) plate of orthotropic material: stiffness can dif
 
 **Simply supported:** exact `sin(mπx/Lx) · sin(nπy/Ly)` shapes with the orthotropic frequency formula.
 
-**Placement score:** an exciter drives the panel around its voice-coil ring, so its coupling to each mode is the mode shape averaged around that ring. The score at a point is the sum of `|coupling|` over all modes below the frequency cutoff. The search excludes a 10% edge margin, since free edges move far more than anywhere practical to mount an exciter, and the heat map's colour scale is set by the interior for the same reason.
+**Coupling:** an exciter drives the panel around its voice-coil ring, so its coupling to each mode is the mode shape averaged around that ring.
+
+**Response and placement score:** from the couplings, the damped modal response gives the panel's average vibration level across frequency (in 1/12-octave bands, with the loss factor η setting damping). Placement is scored by *raggedness*: how far the response wanders, in dB RMS, from its own octave-smoothed trend. The overall slope is set by the panel; peaks and dips are what exciter position controls. The older score (sum of `|coupling|`) is still available. This is a vibration measure, not radiated sound pressure. The search excludes a 10% edge margin, since free edges move far more than anywhere practical to mount an exciter, and the heat map's colour scale is set by the interior for the same reason.
 
 ---
 
@@ -34,6 +36,8 @@ The panel is a thin (Kirchhoff) plate of orthotropic material: stiffness can dif
 - **Exciter size** — voice-coil diameter, which averages out modes smaller than the coil
 - **Both boundary conditions** — free edges (realistic for DML) and simply supported
 - **Heat map** — colour-coded placement score rendered on a proportional canvas, updates live as you change parameters
+- **Response chart** — predicted response at the best position; click anywhere on the panel to compare that position
+- **Modal density** — modes per ⅓ octave, with empty bands flagged
 - **Mode node-line overlay** — select any mode from the dropdown to see its node lines drawn on the panel
 - **Hover inspection** — move the cursor over the panel to read the score at any position
 
@@ -68,7 +72,7 @@ npm run tauri build
 |---|---|---|
 | 1 — Analytical | **Done** | Rectangular panel, placement heat map |
 | A — Accurate modes | **Done** | Rayleigh-Ritz free-edge modes, orthotropic materials, exciter footprint |
-| B — Response scoring | Planned | Damped modal response; score placement by flatness; modes-per-octave plot |
+| B — Response scoring | **Done** | Damped modal response; score placement by flatness; modes-per-octave plot |
 | C — Calibration | Planned | Fit stiffness to tap-test frequencies; overlay REW measurements |
 | D — FEA | Planned | One solver for arbitrary outlines, cutouts and stiffeners (preferably native Rust) |
 | E — Radiation | Optional | Baffled-panel SPL estimate via the Rayleigh integral |
