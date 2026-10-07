@@ -5,7 +5,7 @@
 // panel material evaluate to NaN.
 
 use crate::fem;
-use crate::geometry::{Outline, Panel, Pt};
+use crate::geometry::{Cutout, Outline, Panel, Pt};
 use crate::mesh::{self, Mesh};
 use crate::plate::{self, Boundary, GridBasis, Plate, PointBasis, SolveKey};
 use std::f64::consts::PI;
@@ -22,17 +22,18 @@ pub enum Discretisation {
 }
 
 /// Everything the modes depend on, so equal keys give identical results.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ModelKey {
     pub plate: Plate,
     pub boundary: Boundary,
     pub panel: Panel,
+    pub cutouts: Vec<Cutout>,
     pub disc: Discretisation,
 }
 
 impl ModelKey {
-    pub fn for_freq(plate: Plate, boundary: Boundary, panel: Panel, freq_max: f64) -> ModelKey {
-        let disc = if panel == Panel::Rectangle {
+    pub fn for_freq(plate: Plate, boundary: Boundary, panel: Panel, cutouts: Vec<Cutout>, freq_max: f64) -> ModelKey {
+        let disc = if panel == Panel::Rectangle && cutouts.is_empty() {
             Discretisation::Analytic(SolveKey::for_freq(plate, boundary, freq_max))
         } else {
             let d = plate.rigidities();
@@ -49,7 +50,7 @@ impl ModelKey {
             }
             Discretisation::Fea { h }
         };
-        ModelKey { plate, boundary, panel, disc }
+        ModelKey { plate, boundary, panel, cutouts, disc }
     }
 
     fn fea_freq_limit(&self, h: f64) -> f64 {
@@ -80,7 +81,8 @@ pub struct Model {
 impl Model {
     pub fn solve(key: ModelKey) -> Result<Model, String> {
         let p = key.plate;
-        let shape = key.panel.to_shape(p.lx, p.ly);
+        let shape = key.panel.to_shape(p.lx, p.ly, &key.cutouts);
+        shape.validate(&key.cutouts)?;
         match key.disc {
             Discretisation::Analytic(sk) => {
                 let sol = plate::solve(sk);
@@ -240,7 +242,7 @@ mod tests {
 
     #[test]
     fn mesh_evaluator_reproduces_nodal_values_and_masks_outside() {
-        let key = ModelKey::for_freq(acrylic(0.3, 0.3), Boundary::Free, Panel::Ellipse, 800.0);
+        let key = ModelKey::for_freq(acrylic(0.3, 0.3), Boundary::Free, Panel::Ellipse, vec![], 800.0);
         let model = Model::solve(key).unwrap();
         assert!(model.modes.len() >= 3);
         // Corners of the bounding box are outside a circle; the centre is inside.
@@ -257,10 +259,40 @@ mod tests {
     #[test]
     fn rounded_rectangle_tends_to_rectangle() {
         let p = acrylic(0.3, 0.2);
-        let rect = Model::solve(ModelKey::for_freq(p, Boundary::Free, Panel::Rectangle, 1000.0)).unwrap();
-        let nearly = Model::solve(ModelKey::for_freq(p, Boundary::Free, Panel::RoundedRectangle { radius: 0.002 }, 1000.0)).unwrap();
+        let rect = Model::solve(ModelKey::for_freq(p, Boundary::Free, Panel::Rectangle, vec![], 1000.0)).unwrap();
+        let nearly = Model::solve(ModelKey::for_freq(p, Boundary::Free, Panel::RoundedRectangle { radius: 0.002 }, vec![], 1000.0)).unwrap();
         for (a, b) in rect.modes.iter().zip(&nearly.modes).take(10) {
             assert!((a.freq - b.freq).abs() / a.freq < 0.02, "{} vs {}", a.freq, b.freq);
         }
+    }
+
+    #[test]
+    fn tiny_hole_barely_changes_modes() {
+        let p = acrylic(0.3, 0.2);
+        let plain = Model::solve(ModelKey::for_freq(p, Boundary::Free, Panel::Rectangle, vec![], 1000.0)).unwrap();
+        let holed = Model::solve(ModelKey::for_freq(
+            p, Boundary::Free, Panel::Rectangle, vec![Cutout::Hole { x: 0.11, y: 0.07, d: 0.004 }], 1000.0,
+        )).unwrap();
+        assert!(matches!(holed.key.disc, Discretisation::Fea { .. }));
+        for (a, b) in plain.modes.iter().zip(&holed.modes).take(12) {
+            assert!((a.freq - b.freq).abs() / a.freq < 0.02, "{} vs {}", a.freq, b.freq);
+        }
+    }
+
+    #[test]
+    fn slotted_panel_converges_with_mesh_refinement() {
+        let p = acrylic(0.3, 0.2);
+        let slot = vec![Cutout::Slot { x: 0.15, y: 0.1, length: 0.12, width: 0.01, angle: 90.0 }];
+        let coarse = ModelKey::for_freq(p, Boundary::Free, Panel::Rectangle, slot.clone(), 1500.0);
+        let Discretisation::Fea { h } = coarse.disc else { panic!("expected FEA") };
+        let fine = ModelKey { disc: Discretisation::Fea { h: h / 2.0 }, ..coarse.clone() };
+        let (a, b) = (Model::solve(coarse).unwrap(), Model::solve(fine).unwrap());
+        let plain = Model::solve(ModelKey::for_freq(p, Boundary::Free, Panel::Rectangle, vec![], 1500.0)).unwrap();
+        for (x, y) in a.modes.iter().zip(&b.modes).take(15) {
+            assert!((x.freq - y.freq).abs() / y.freq < 0.02, "{} vs {}", x.freq, y.freq);
+        }
+        // A slot across the middle cuts the panel's bending path along x,
+        // so the first (2,0)-type bending modes must drop.
+        assert!(b.modes[1].freq < plain.modes[1].freq * 0.98, "{} vs {}", b.modes[1].freq, plain.modes[1].freq);
     }
 }

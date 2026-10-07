@@ -42,15 +42,119 @@ pub enum Panel {
 }
 
 impl Panel {
-    pub fn to_shape(self, w: f64, h: f64) -> Shape {
+    pub fn to_shape(self, w: f64, h: f64, cutouts: &[Cutout]) -> Shape {
         let outline = match self {
             Panel::Rectangle => Path::rectangle(0.0, 0.0, w, h),
             Panel::RoundedRectangle { radius } => Path::rounded_rectangle(0.0, 0.0, w, h, radius),
             Panel::Ellipse => Path::ellipse(0.0, 0.0, w, h),
             Panel::Polygon { sides } => Path::regular_polygon(0.0, 0.0, w, h, sides),
         };
-        Shape { outline, holes: Vec::new() }
+        Shape { outline, holes: cutouts.iter().map(Cutout::to_path).collect() }
     }
+}
+
+/// A hole cut through the panel. Positions are the cutout's centre, in
+/// metres from the top-left of the bounding box.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Cutout {
+    /// Round hole of diameter `d`.
+    Hole { x: f64, y: f64, d: f64 },
+    /// Slot with semicircular ends: overall `length` end to end, `width`
+    /// across, rotated `angle` degrees clockwise from horizontal.
+    Slot { x: f64, y: f64, length: f64, width: f64, angle: f64 },
+}
+
+impl Cutout {
+    pub fn to_path(&self) -> Path {
+        match *self {
+            Cutout::Hole { x, y, d } => Path::ellipse(x - d / 2.0, y - d / 2.0, d, d),
+            Cutout::Slot { x, y, length, width, angle } => {
+                let r = width / 2.0;
+                let s = (length - width).max(0.0) / 2.0;  // half the straight part
+                let k = r * KAPPA;
+                let (sin, cos) = angle.to_radians().sin_cos();
+                let t = |p: Pt| -> Pt { [x + p[0] * cos - p[1] * sin, y + p[0] * sin + p[1] * cos] };
+                Path {
+                    start: t([-s, -r]),
+                    segments: vec![
+                        Segment::Line { to: t([s, -r]) },
+                        Segment::Cubic { c1: t([s + k, -r]), c2: t([s + r, -k]), to: t([s + r, 0.0]) },
+                        Segment::Cubic { c1: t([s + r, k]), c2: t([s + k, r]), to: t([s, r]) },
+                        Segment::Line { to: t([-s, r]) },
+                        Segment::Cubic { c1: t([-s - k, r]), c2: t([-s - r, k]), to: t([-s - r, 0.0]) },
+                        Segment::Cubic { c1: t([-s - r, -k]), c2: t([-s - k, -r]), to: t([-s, -r]) },
+                    ],
+                }
+            }
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            Cutout::Hole { .. } => "Hole",
+            Cutout::Slot { .. } => "Slot",
+        }
+    }
+
+    fn size_ok(&self) -> bool {
+        match *self {
+            Cutout::Hole { d, .. } => d > 0.0,
+            Cutout::Slot { length, width, .. } => width > 0.0 && length > 0.0,
+        }
+    }
+}
+
+/// Smallest gap allowed between a cutout and the panel edge or another
+/// cutout. Narrower ligaments can't be meshed sensibly.
+pub const MIN_GAP: f64 = 0.001;
+
+impl Shape {
+    /// Checks that every cutout lies inside the outline and keeps at least
+    /// `MIN_GAP` from the edge and from other cutouts. `cutouts` are the
+    /// sources of `self.holes`, in order, for error messages.
+    pub fn validate(&self, cutouts: &[Cutout]) -> Result<(), String> {
+        let res = |path: &Path| -> Vec<Pt> {
+            let o = Outline::from_rings(vec![path.flatten(f64::MAX)]);
+            let size = o.rings[0].iter().zip(o.rings[0].iter().skip(1)).map(|(a, b)| dist(*a, *b)).sum::<f64>();
+            path.flatten((size / 200.0).max(1e-5))
+        };
+        let outer = res(&self.outline);
+        let outer_only = Outline::from_rings(vec![outer.clone()]);
+        let rings: Vec<Vec<Pt>> = self.holes.iter().map(res).collect();
+        for (i, ring) in rings.iter().enumerate() {
+            let label = || format!("{} {}", cutouts[i].name(), i + 1);
+            if !cutouts[i].size_ok() {
+                return Err(format!("{} needs a positive size", label()));
+            }
+            if ring.iter().any(|p| !outer_only.contains(*p)) {
+                return Err(format!("{} extends past the panel edge", label()));
+            }
+            if ring_gap(ring, &outer) < MIN_GAP {
+                return Err(format!("{} is closer than 1 mm to the panel edge", label()));
+            }
+            for (j, other) in rings.iter().enumerate().take(i) {
+                let other_only = Outline::from_rings(vec![other.clone()]);
+                let this_only = Outline::from_rings(vec![ring.clone()]);
+                if ring.iter().any(|p| other_only.contains(*p))
+                    || other.iter().any(|p| this_only.contains(*p))
+                    || ring_gap(ring, other) < MIN_GAP
+                {
+                    return Err(format!("{} overlaps or nearly touches {} {}", label(), cutouts[j].name(), j + 1));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Smallest distance between the vertices of one ring and the edges of another.
+fn ring_gap(a: &[Pt], b: &[Pt]) -> f64 {
+    let ob = Outline::from_rings(vec![b.to_vec()]);
+    let oa = Outline::from_rings(vec![a.to_vec()]);
+    a.iter().map(|p| ob.distance_to_edge(*p))
+        .chain(b.iter().map(|p| oa.distance_to_edge(*p)))
+        .fold(f64::MAX, f64::min)
 }
 
 // Bézier control distance for a quarter circle of unit radius.
@@ -194,8 +298,15 @@ pub struct Outline {
 
 impl Outline {
     pub fn new(shape: &Shape, max_len: f64) -> Outline {
+        // Small holes get at least 24 edges, so a 10 mm hole in a coarse mesh
+        // is still round rather than a square.
+        let flatten = |path: &Path| {
+            let ring = path.flatten(max_len);
+            let perimeter: f64 = (0..ring.len()).map(|i| dist(ring[i], ring[(i + 1) % ring.len()])).sum();
+            if perimeter / max_len < 24.0 { path.flatten(perimeter / 24.0) } else { ring }
+        };
         let mut rings = vec![shape.outline.flatten(max_len)];
-        rings.extend(shape.holes.iter().map(|h| h.flatten(max_len)));
+        rings.extend(shape.holes.iter().map(flatten));
         Outline { rings }
     }
 
@@ -228,8 +339,17 @@ impl Outline {
 
     /// Distance to the nearest edge (outline or hole).
     pub fn distance_to_edge(&self, p: Pt) -> f64 {
+        self.distance_to_rings(p, 0..self.rings.len())
+    }
+
+    /// Distances to the outer outline and to the nearest hole (MAX if none).
+    pub fn distance_to_outline_and_holes(&self, p: Pt) -> (f64, f64) {
+        (self.distance_to_rings(p, 0..1), self.distance_to_rings(p, 1..self.rings.len()))
+    }
+
+    fn distance_to_rings(&self, p: Pt, which: std::ops::Range<usize>) -> f64 {
         let mut best = f64::MAX;
-        for ring in &self.rings {
+        for ring in &self.rings[which] {
             for i in 0..ring.len() {
                 let a = ring[i];
                 let b = ring[(i + 1) % ring.len()];
@@ -286,6 +406,31 @@ mod tests {
         let max_x = pts.iter().map(|p| p[0]).fold(f64::MIN, f64::max);
         let max_y = pts.iter().map(|p| p[1]).fold(f64::MIN, f64::max);
         assert!((max_x - 0.3).abs() < 1e-12 && (max_y - 0.2).abs() < 1e-12);
+    }
+
+    #[test]
+    fn slot_area_and_orientation() {
+        let slot = Cutout::Slot { x: 0.15, y: 0.1, length: 0.1, width: 0.02, angle: 90.0 };
+        let o = Outline::new(&Shape { outline: slot.to_path(), holes: vec![] }, 0.0005);
+        let exact = 0.08 * 0.02 + PI * 0.01 * 0.01;
+        assert!((o.area() - exact).abs() / exact < 1e-3, "{} vs {exact}", o.area());
+        // Rotated 90°: long axis vertical.
+        assert!(o.contains([0.15, 0.14]) && !o.contains([0.19, 0.1]));
+    }
+
+    #[test]
+    fn cutouts_are_validated() {
+        let ok = |c: Vec<Cutout>| Panel::Rectangle.to_shape(0.3, 0.2, &c).validate(&c);
+        assert!(ok(vec![Cutout::Hole { x: 0.1, y: 0.1, d: 0.05 }]).is_ok());
+        assert!(ok(vec![Cutout::Hole { x: 0.01, y: 0.1, d: 0.05 }]).unwrap_err().contains("past the panel edge"));
+        assert!(ok(vec![Cutout::Hole { x: 0.0255, y: 0.1, d: 0.05 }]).unwrap_err().contains("closer than 1 mm"));
+        assert!(ok(vec![Cutout::Hole { x: 0.1, y: 0.1, d: 0.05 }, Cutout::Hole { x: 0.12, y: 0.1, d: 0.05 }])
+            .unwrap_err().contains("overlaps"));
+        assert!(ok(vec![Cutout::Hole { x: 0.1, y: 0.1, d: 0.02 }, Cutout::Hole { x: 0.1, y: 0.1, d: 0.06 }])
+            .unwrap_err().contains("overlaps"));
+        // Ellipse: a hole in the bounding-box corner is off the panel.
+        let c = vec![Cutout::Hole { x: 0.03, y: 0.03, d: 0.02 }];
+        assert!(Panel::Ellipse.to_shape(0.3, 0.2, &c).validate(&c).is_err());
     }
 
     #[test]

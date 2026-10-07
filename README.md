@@ -37,6 +37,7 @@ The panel is a thin (Kirchhoff) plate of orthotropic material: stiffness can dif
 - **7 material presets** — XPS foam, EPS foam, balsa, birch plywood, acrylic, aluminium, carbon fibre — with fields that auto-fill and remain editable; balsa and plywood are orthotropic (grain along the width)
 - **Exciter size** — voice-coil diameter, which averages out modes smaller than the coil
 - **Panel shapes** — rectangle (exact solver), plus rounded rectangle, ellipse/circle and regular polygon (finite-element analysis)
+- **Cutouts** — round holes and slots (any angle); slots cut the bending path across them, lowering those modes and adding modal density
 - **Both boundary conditions** — free edges (realistic for DML) and simply supported
 - **Heat map** — colour-coded placement score rendered on a proportional canvas, updates live as you change parameters
 - **Response chart** — predicted response at the best position; click anywhere on the panel to compare that position
@@ -78,7 +79,7 @@ npm run tauri build
 | B — Response scoring | **Done** | Damped modal response; score placement by flatness; modes-per-octave plot |
 | C — Calibration | Planned | Fit stiffness to tap-test frequencies; overlay REW measurements |
 | D1 — FEA engine | **Done** | Native Rust FEA (DKT elements, sparse eigen-solver); rounded-rectangle, ellipse/circle and polygon panels |
-| D2 — Cutouts | Planned | Holes and slots |
+| D2 — Cutouts | **Done** | Round holes and rounded-end slots at any angle |
 | D3 — Stiffeners | Planned | Bonded ribs and bars |
 | D4 — Custom outlines | Planned | Bézier-curve outline editor |
 | E — Radiation | Optional | Baffled-panel SPL estimate via the Rayleigh integral |

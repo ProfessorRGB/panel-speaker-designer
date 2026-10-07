@@ -5,8 +5,8 @@ mod model;
 mod plate;
 mod response;
 
-use geometry::{Panel, Pt};
-use model::{Model, ModelKey};
+use geometry::{Cutout, Panel, Pt};
+use model::{Discretisation, Model, ModelKey};
 use nalgebra::DMatrix;
 use plate::{Boundary, Plate};
 use response::Bands;
@@ -19,6 +19,8 @@ pub struct PanelParams {
     pub shape: String,    // "rectangle" | "rounded_rectangle" | "ellipse" | "polygon"
     pub corner_r: f64,    // rounded-rectangle corner radius [m]
     pub sides: usize,     // polygon side count
+    #[serde(default)]
+    pub cutouts: Vec<Cutout>,  // holes and slots, positions in metres
     pub lx: f64,          // panel width  [m]
     pub ly: f64,          // panel height [m]
     pub h: f64,           // thickness    [m]
@@ -106,15 +108,18 @@ impl PanelParams {
         };
         // Resolve modes somewhat above freq_max, so the response near the top
         // of the band includes the tails of the modes just beyond it.
-        Ok(ModelKey::for_freq(plate, boundary, panel, self.freq_max * RESPONSE_HEADROOM))
+        Ok(ModelKey::for_freq(plate, boundary, panel, self.cutouts.clone(), self.freq_max * RESPONSE_HEADROOM))
     }
 
-    /// Minimum distance from any edge for a candidate exciter position.
-    /// Free edges always move a lot, and edges are impractical mounting
-    /// locations; the margin also keeps the whole exciter on the panel.
-    fn edge_margin(&self) -> f64 {
+    /// Minimum distances from the outer edge and from cutout edges for a
+    /// candidate exciter position. The panel's outer free edges move far more
+    /// than the interior and are impractical mounting locations, so they get
+    /// a wide margin; near a cutout the exciter just needs to fit.
+    fn edge_margins(&self) -> (f64, f64) {
         const EDGE_MARGIN: f64 = 0.10;
-        (EDGE_MARGIN * self.lx.min(self.ly)).max(self.exciter_d.max(0.0) / 2.0)
+        const CUTOUT_CLEARANCE: f64 = 0.003;
+        let radius = self.exciter_d.max(0.0) / 2.0;
+        ((EDGE_MARGIN * self.lx.min(self.ly)).max(radius), radius + CUTOUT_CLEARANCE)
     }
 }
 
@@ -243,7 +248,10 @@ fn compute_heatmap(params: PanelParams) -> Result<CalculationResult, String> {
     let n = params.grid_n.clamp(4, 100);
     let truncated_above = (model.freq_limit < params.freq_max).then_some(model.freq_limit);
     let flatness = params.score != "coupling";
-    let solver = if model.key.panel == Panel::Rectangle { "analytic" } else { "fea" };
+    let solver = match model.key.disc {
+        Discretisation::Analytic(_) => "analytic",
+        Discretisation::Fea { .. } => "fea",
+    };
 
     let modes = model.modes[..mode_count].iter()
         .map(|m| ModeInfo { m: m.label.map(|l| l.0), n: m.label.map(|l| l.1), freq: m.freq })
@@ -253,12 +261,14 @@ fn compute_heatmap(params: PanelParams) -> Result<CalculationResult, String> {
         .collect();
 
     // Classify grid cells by position relative to the panel edges.
-    let margin = params.edge_margin();
+    let (outer_margin, cutout_margin) = params.edge_margins();
     let region: Vec<u8> = (0..n * n).map(|i| {
         let p = [((i % n) as f64 + 0.5) / n as f64 * params.lx, ((i / n) as f64 + 0.5) / n as f64 * params.ly];
         if !model.outline.contains(p) {
-            REGION_OUTSIDE
-        } else if model.outline.distance_to_edge(p) < margin {
+            return REGION_OUTSIDE;
+        }
+        let (outer, holes) = model.outline.distance_to_outline_and_holes(p);
+        if outer < outer_margin || holes < cutout_margin {
             REGION_MARGIN
         } else {
             REGION_SEARCH

@@ -3,10 +3,16 @@ import { ModeDensityChart, ResponseChart, Series } from "./charts";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
+// Cutouts as sent to Rust: positions and sizes in metres, angle in degrees.
+type Cutout =
+  | { kind: "hole"; x: number; y: number; d: number }
+  | { kind: "slot"; x: number; y: number; length: number; width: number; angle: number };
+
 interface PanelParams {
   shape: string;
   corner_r: number;
   sides: number;
+  cutouts: Cutout[];
   lx: number;
   ly: number;
   h: number;
@@ -93,6 +99,9 @@ let requestId = 0;  // newer calculations supersede older in-flight ones
 // A position the user clicked, to compare its response with the optimum.
 interface Probe { x: number; y: number; db: number[]; raggedness: number }
 let probe: Probe | null = null;
+
+// Cutouts as edited in the sidebar, in mm (angle in degrees).
+let cutouts: Cutout[] = [];
 
 // ── DOM refs ─────────────────────────────────────────────────────────────────
 
@@ -379,6 +388,9 @@ function getParams(): PanelParams {
     shape:     selectShape.value,
     corner_r:  Math.max(0, parseFloat(inputCornerR.value) || 0) / 1000,
     sides:     Math.min(64, Math.max(3, parseInt(inputSides.value) || 6)),
+    cutouts:   cutouts.map((c) => c.kind === "hole"
+      ? { ...c, x: c.x / 1000, y: c.y / 1000, d: c.d / 1000 }
+      : { ...c, x: c.x / 1000, y: c.y / 1000, length: c.length / 1000, width: c.width / 1000 }),
     lx:        parseFloat(inputLx.value) / 1000,
     ly:        parseFloat(inputLy.value) / 1000,
     h:         parseFloat(inputH.value)  / 1000,
@@ -686,6 +698,87 @@ function syncShapeFields() {
   $("field-sides").hidden = shape !== "polygon";
   $("shape-hint").hidden = shape === "rectangle";
 }
+// ── Cutouts ──────────────────────────────────────────────────────────────────
+
+const cutoutList = $("cutout-list");
+
+type CutoutField = { key: string; label: string; unit: string; step: number };
+const CUTOUT_FIELDS: Record<Cutout["kind"], CutoutField[]> = {
+  hole: [
+    { key: "x", label: "X", unit: "mm", step: 1 },
+    { key: "y", label: "Y", unit: "mm", step: 1 },
+    { key: "d", label: "Diameter", unit: "mm", step: 1 },
+  ],
+  slot: [
+    { key: "x", label: "X", unit: "mm", step: 1 },
+    { key: "y", label: "Y", unit: "mm", step: 1 },
+    { key: "length", label: "Length", unit: "mm", step: 1 },
+    { key: "width", label: "Width", unit: "mm", step: 0.5 },
+    { key: "angle", label: "Angle (clockwise)", unit: "°", step: 5 },
+  ],
+};
+
+function renderCutouts() {
+  cutoutList.innerHTML = "";
+  cutouts.forEach((c, i) => {
+    const card = document.createElement("div");
+    card.className = "cutout-card";
+    const header = document.createElement("header");
+    header.textContent = `${c.kind === "hole" ? "Hole" : "Slot"} ${i + 1}`;
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.textContent = "×";
+    remove.title = "Remove this cutout";
+    remove.addEventListener("click", () => {
+      cutouts.splice(i, 1);
+      renderCutouts();
+      scheduleCalculate();
+    });
+    header.appendChild(remove);
+    card.appendChild(header);
+
+    for (const f of CUTOUT_FIELDS[c.kind]) {
+      const label = document.createElement("label");
+      label.textContent = f.label;
+      const wrap = document.createElement("div");
+      wrap.className = "input-with-unit";
+      const input = document.createElement("input");
+      input.type = "number";
+      input.step = String(f.step);
+      input.value = String((c as Record<string, number | string>)[f.key]);
+      input.addEventListener("input", () => {
+        const v = parseFloat(input.value);
+        if (!isNaN(v)) {
+          (c as Record<string, number | string>)[f.key] = v;
+          scheduleCalculate();
+        }
+      });
+      const unit = document.createElement("span");
+      unit.className = "unit";
+      unit.textContent = f.unit;
+      wrap.append(input, unit);
+      label.appendChild(wrap);
+      card.appendChild(label);
+    }
+    cutoutList.appendChild(card);
+  });
+}
+
+function addCutout(kind: Cutout["kind"]) {
+  const w = parseFloat(inputLx.value) || 300;
+  const h = parseFloat(inputLy.value) || 200;
+  // Start somewhere plausible; the user positions it from there.
+  cutouts.push(kind === "hole"
+    ? { kind, x: Math.round(w * 0.3), y: Math.round(h * 0.5), d: Math.round(Math.min(w, h) * 0.1) }
+    : { kind, x: Math.round(w * 0.5), y: Math.round(h * 0.5), length: Math.round(h * 0.5), width: 8, angle: 90 });
+  probe = null;
+  renderCutouts();
+  scheduleCalculate();
+}
+
+$("add-hole").addEventListener("click", () => addCutout("hole"));
+$("add-slot").addEventListener("click", () => addCutout("slot"));
+
 selectShape.addEventListener("change", () => {
   syncShapeFields();
   probe = null;  // a clicked position may not be on the new shape

@@ -334,6 +334,72 @@ select:focus {
 
 /* Info bar */
 
+/* Cutouts */
+
+.cutout-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.cutout-list:empty {
+  display: none;
+}
+
+.cutout-card {
+  border: 1px solid var(--input-border);
+  border-radius: var(--radius);
+  padding: 6px 8px 8px;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+
+.cutout-card header {
+  grid-column: 1 / -1;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--sidebar-text);
+}
+
+.cutout-card label {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 10px;
+  color: var(--sidebar-muted);
+}
+
+.cutout-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.cutout-actions button,
+.cutout-card header button {
+  background: var(--input-bg);
+  border: 1px solid var(--input-border);
+  border-radius: var(--radius);
+  color: var(--sidebar-text);
+  font: inherit;
+  font-size: 11px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+
+.cutout-card header button {
+  padding: 0 6px;
+  line-height: 18px;
+}
+
+.cutout-actions button:hover,
+.cutout-card header button:hover {
+  border-color: var(--input-focus);
+}
+
 /* Charts */
 
 .chart-panel {
