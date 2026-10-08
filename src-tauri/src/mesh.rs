@@ -127,10 +127,10 @@ mod tests {
         assert!((0..m.tris.len()).all(|t| m.triangle_area(t) > 0.0));
         // No triangle centroid inside the hole.
         let check = |m: &Mesh| {
-        for t in &m.tris {
-            let c = t.iter().fold([0.0, 0.0], |a, &i| [a[0] + m.nodes[i][0] / 3.0, a[1] + m.nodes[i][1] / 3.0]);
-            assert!(outline.contains(c));
-        }
+            for t in &m.tris {
+                let c = t.iter().fold([0.0, 0.0], |a, &i| [a[0] + m.nodes[i][0] / 3.0, a[1] + m.nodes[i][1] / 3.0]);
+                assert!(outline.contains(c));
+            }
         };
         check(&m);
 
