@@ -21,6 +21,16 @@
       <!-- Geometry -->
       <section class="input-section">
         <div class="section-label">Geometry</div>
+        <div class="field full-width">
+          <label for="shape">Shape</label>
+          <select id="shape">
+            <option value="rectangle" selected>Rectangle</option>
+            <option value="rounded_rectangle">Rounded rectangle</option>
+            <option value="ellipse">Ellipse / circle</option>
+            <option value="polygon">Regular polygon</option>
+            <option value="custom">Custom (Bézier)</option>
+          </select>
+        </div>
         <div class="field">
           <label for="lx">Width</label>
           <div class="input-with-unit">
@@ -35,6 +45,18 @@
             <span class="unit">mm</span>
           </div>
         </div>
+        <div class="field" id="field-corner-r" hidden>
+          <label for="corner-r">Corner radius</label>
+          <div class="input-with-unit">
+            <input type="number" id="corner-r" value="30" min="0" max="1500" step="1"/>
+            <span class="unit">mm</span>
+          </div>
+        </div>
+        <div class="field" id="field-sides" hidden>
+          <label for="sides">Sides</label>
+          <input type="number" id="sides" value="6" min="3" max="64" step="1"/>
+        </div>
+        <div class="field-hint" id="shape-hint" hidden>Width and height set the bounding box. Shapes other than rectangles are solved by finite-element analysis, which takes about a second.</div>
         <div class="field">
           <label for="h">Thickness</label>
           <div class="input-with-unit">
@@ -42,6 +64,27 @@
             <span class="unit">mm</span>
           </div>
         </div>
+      </section>
+
+      <!-- Cutouts -->
+      <section class="input-section">
+        <div class="section-label">Cutouts</div>
+        <div id="cutout-list" class="cutout-list"></div>
+        <div class="cutout-actions">
+          <button type="button" id="add-hole">+ Hole</button>
+          <button type="button" id="add-slot">+ Slot</button>
+        </div>
+        <div class="field-hint">Positions are the cutout's centre, from the top-left corner. Slots cut the bending path across them, lowering those modes.</div>
+      </section>
+
+      <!-- Stiffeners -->
+      <section class="input-section">
+        <div class="section-label">Stiffeners</div>
+        <div id="stiffener-list" class="cutout-list"></div>
+        <div class="cutout-actions">
+          <button type="button" id="add-stiffener">+ Rib</button>
+        </div>
+        <div class="field-hint">Straight ribs glued to one face, from one end point to the other. Height is the rib's depth off the panel. Stiffness is an approximation (rib plus a strip of panel acting as a T-beam).</div>
       </section>
 
       <!-- Material -->
@@ -150,10 +193,16 @@
       <!-- Canvas toolbar -->
       <div class="canvas-toolbar">
         <div class="toolbar-left">
+          <button type="button" id="solve-btn" class="solve-btn" title="Solve with the current settings (Enter in any field)">Solve</button>
+          <label class="toolbar-item auto-solve" title="Solve automatically after each change. Fine for rectangles; other shapes take a second or more per solve.">
+            <input type="checkbox" id="auto-solve"/>
+            <span>Auto</span>
+          </label>
           <span class="toolbar-label">Placement score</span>
           <span id="mode-count-badge" class="badge"></span>
         </div>
         <div class="toolbar-right">
+          <button type="button" id="edit-outline" class="toolbar-btn" hidden>Edit outline</button>
           <label class="toolbar-item">
             <span>Mode overlay</span>
             <select id="mode-select">
@@ -167,6 +216,7 @@
       <div class="canvas-wrap" id="canvas-wrap">
         <canvas id="heatmap"></canvas>
         <div id="hover-tooltip" class="hover-tooltip"></div>
+        <div id="outline-hint" class="outline-hint" hidden>Drag points and handles · double-click the outline to add a point · select a point and press Delete to remove it · Option-click a point to switch corner ↔ smooth · ⌘Z to undo · press Solve when done</div>
       </div>
 
       <!-- Charts -->

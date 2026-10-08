@@ -1,9 +1,28 @@
 import { invoke } from "@tauri-apps/api/core";
 import { ModeDensityChart, ResponseChart, Series } from "./charts";
+import { Frame, OutlineEditor, anchorsFromShape, toPath } from "./outline-editor";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
+// Cutouts as sent to Rust: positions and sizes in metres, angle in degrees.
+type Cutout =
+  | { kind: "hole"; x: number; y: number; d: number }
+  | { kind: "slot"; x: number; y: number; length: number; width: number; angle: number };
+
+// Stiffener as sent to Rust: metres, Pa, kg/m³.
+interface StiffenerParams {
+  x1: number; y1: number; x2: number; y2: number;
+  width: number; height: number;
+  e: number; g: number; rho: number;
+}
+
 interface PanelParams {
+  shape: string;
+  corner_r: number;
+  sides: number;
+  custom_path: ReturnType<typeof toPath> | null;
+  cutouts: Cutout[];
+  stiffeners: StiffenerParams[];
   lx: number;
   ly: number;
   h: number;
@@ -21,25 +40,30 @@ interface PanelParams {
 }
 
 interface ModeInfo {
-  m: number;
-  n: number;
+  m: number | null;  // nodal-line counts; null where not meaningful
+  n: number | null;
   freq: number;
 }
 
+// Grid cells: candidate positions, edge margin, and outside the panel.
+const REGION_MARGIN = 1;
+const REGION_OUTSIDE = 2;
+
 interface CalculationResult {
-  grid: number[];
-  grid_raw: number[];
+  grid: (number | null)[];      // null outside the panel
+  grid_raw: (number | null)[];
+  region: number[];
+  outline: [number, number][][];  // outline and hole rings, normalised
   grid_n: number;
   modes: ModeInfo[];
   mode_count: number;
   optimal_x: number;
   optimal_y: number;
   optimal_score_raw: number;
-  margin_x: number;
-  margin_y: number;
   bands: number[];
   response_opt: number[];
   raggedness_opt: number;
+  solver: "analytic" | "fea";
   truncated_above: number | null;
 }
 
@@ -78,7 +102,7 @@ const SHAPE_GRID_N = 120;
 let lastResult: CalculationResult | null = null;
 let lastParams: PanelParams | null = null;
 let selectedModeIdx = -1;
-let selectedShape: number[] | null = null;
+let selectedShape: (number | null)[] | null = null;
 let calcTimer: ReturnType<typeof setTimeout> | null = null;
 let requestId = 0;  // newer calculations supersede older in-flight ones
 
@@ -86,10 +110,32 @@ let requestId = 0;  // newer calculations supersede older in-flight ones
 interface Probe { x: number; y: number; db: number[]; raggedness: number }
 let probe: Probe | null = null;
 
+// Cutouts as edited in the sidebar, in mm (angle in degrees).
+let cutouts: Cutout[] = [];
+
+// Rib materials: moduli in MPa along the rib, density in kg/m³.
+const RIB_MATERIALS: Record<string, { label: string; e: number; g: number; rho: number }> = {
+  spruce:   { label: "Spruce",           e: 10000,  g: 620,   rho: 450 },
+  carbon:   { label: "Carbon fibre bar", e: 130000, g: 5000,  rho: 1550 },
+  aluminum: { label: "Aluminium",        e: 69000,  g: 26000, rho: 2700 },
+  panel:    { label: "Same as panel",    e: 0,      g: 0,     rho: 0 },
+};
+
+// Stiffeners as edited in the sidebar, in mm.
+interface Stiffener {
+  x1: number; y1: number; x2: number; y2: number;
+  width: number; height: number;
+  material: keyof typeof RIB_MATERIALS;
+}
+let stiffeners: Stiffener[] = [];
+
 // ── DOM refs ─────────────────────────────────────────────────────────────────
 
 const $ = (id: string) => document.getElementById(id)!;
 
+const selectShape    = $("shape")      as HTMLSelectElement;
+const inputCornerR   = $("corner-r")   as HTMLInputElement;
+const inputSides     = $("sides")      as HTMLInputElement;
 const inputLx        = $("lx")         as HTMLInputElement;
 const inputLy        = $("ly")         as HTMLInputElement;
 const inputH         = $("h")          as HTMLInputElement;
@@ -169,9 +215,10 @@ function getCanvasSize(lx: number, ly: number): { cw: number; ch: number; scale:
   };
 }
 
-function render() {
-  if (!lastResult) return;
+// The panel's pixel frame on the canvas, from the last render.
+let panelFrame: Frame | null = null;
 
+function render() {
   const lxMm = parseFloat(inputLx.value);
   const lyMm = parseFloat(inputLy.value);
   const { cw, ch, scale } = getCanvasSize(lxMm, lyMm);
@@ -186,49 +233,85 @@ function render() {
   const ph = Math.round(lyMm * scale);   // panel pixel height
   const ox = Math.round((cw - pw) / 2);  // panel offset x
   const oy = Math.round((ch - ph) / 2);
+  panelFrame = { ox, oy, pw, ph };
 
-  const { grid, grid_n, optimal_x, optimal_y, margin_x, margin_y } = lastResult;
+  const custom = selectShape.value === "custom";
+  if (!lastResult) {
+    if (custom) editor.draw(ctx, panelFrame);
+    return;
+  }
+
+  const { grid, grid_n, region, outline, optimal_x, optimal_y } = lastResult;
 
   // ── Heat map ───────────────────────────────────────────────────────────────
   const cellW = pw / grid_n;
   const cellH = ph / grid_n;
 
-  for (let row = 0; row < grid_n; row++) {
-    for (let col = 0; col < grid_n; col++) {
-      const v = grid[row * grid_n + col];
-      const [r, g, b] = sampleColormap(v);
-      ctx.fillStyle = `rgb(${r},${g},${b})`;
-      ctx.fillRect(
-        ox + col * cellW,
-        oy + row * cellH,
-        Math.ceil(cellW),
-        Math.ceil(cellH),
-      );
-    }
+  // The panel's real outline (and holes), used to clip and to draw the border.
+  const outlinePath = new Path2D();
+  for (const ring of outline) {
+    ring.forEach(([x, y], i) => {
+      const px = ox + x * pw, py = oy + y * ph;
+      if (i === 0) outlinePath.moveTo(px, py); else outlinePath.lineTo(px, py);
+    });
+    outlinePath.closePath();
   }
 
-  // ── Edge margin ───────────────────────────────────────────────────────────
-  // Excluded from the search; the colour scale is set by the interior, so
-  // these cells are clipped. Dim them to show they aren't candidates.
-  const mx = margin_x * pw;
-  const my = margin_y * ph;
-  ctx.fillStyle = "rgba(0,0,0,0.45)";
-  ctx.beginPath();
-  ctx.rect(ox, oy, pw, ph);
-  ctx.rect(ox + mx, oy + ph - my, pw - 2 * mx, -(ph - 2 * my));  // reverse winding cuts a hole
-  ctx.fill("evenodd");
-  ctx.strokeStyle = "rgba(255,255,255,0.25)";
-  ctx.setLineDash([3, 3]);
-  ctx.strokeRect(ox + mx, oy + my, pw - 2 * mx, ph - 2 * my);
-  ctx.setLineDash([]);
+  // Cells straddling a curved edge have their centre outside the panel;
+  // borrow a neighbour's value so the clipped edge has no gaps.
+  const display = fillOutside(grid, grid_n);
+  ctx.save();
+  ctx.clip(outlinePath, "evenodd");
+  // While editing the outline, the old result is only a backdrop.
+  ctx.globalAlpha = editor.active ? 0.3 : 1;
+  for (let row = 0; row < grid_n; row++) {
+    for (let col = 0; col < grid_n; col++) {
+      const i = row * grid_n + col;
+      const v = display[i];
+      if (v === null) continue;
+      const [r, g, b] = sampleColormap(v);
+      ctx.fillStyle = `rgb(${r},${g},${b})`;
+      const x = ox + col * cellW, y = oy + row * cellH;
+      ctx.fillRect(x, y, Math.ceil(cellW), Math.ceil(cellH));
+      // Edge margin: excluded from the search, and the colour scale is set
+      // by the interior, so these cells are clipped. Dim them.
+      if (region[i] !== 0) {
+        ctx.fillStyle = "rgba(0,0,0,0.45)";
+        ctx.fillRect(x, y, Math.ceil(cellW), Math.ceil(cellH));
+      }
+    }
+  }
+  ctx.restore();
 
   // ── Panel border ──────────────────────────────────────────────────────────
   ctx.strokeStyle = "rgba(255,255,255,0.5)";
   ctx.lineWidth = 1;
-  ctx.strokeRect(ox, oy, pw, ph);
+  ctx.stroke(outlinePath);
+
+  // ── Stiffeners ────────────────────────────────────────────────────────────
+  ctx.save();
+  ctx.lineCap = "round";
+  for (const s of stiffeners) {
+    const ax = ox + (s.x1 / lxMm) * pw, ay = oy + (s.y1 / lyMm) * ph;
+    const bx = ox + (s.x2 / lxMm) * pw, by = oy + (s.y2 / lyMm) * ph;
+    const width = Math.max(3, s.width * scale);
+    ctx.beginPath();
+    ctx.moveTo(ax, ay);
+    ctx.lineTo(bx, by);
+    ctx.strokeStyle = "rgba(0,0,0,0.55)";
+    ctx.lineWidth = width + 2;
+    ctx.stroke();
+    ctx.strokeStyle = "rgba(240,228,200,0.9)";
+    ctx.lineWidth = width;
+    ctx.stroke();
+  }
+  ctx.restore();
+
+  // ── Custom outline (editor) ────────────────────────────────────────────────
+  if (custom) editor.draw(ctx, panelFrame);
 
   // ── Mode node lines ───────────────────────────────────────────────────────
-  if (selectedShape) {
+  if (selectedShape && !editor.active) {
     drawNodeLines(ctx, selectedShape, SHAPE_GRID_N, ox, oy, pw, ph);
   }
 
@@ -259,7 +342,7 @@ function render() {
   ctx.fill();
 
   // ── Clicked comparison position ───────────────────────────────────────────
-  if (probe) {
+  if (probe && !editor.active) {
     const px = ox + probe.x * pw;
     const py = oy + probe.y * ph;
     ctx.lineWidth = 4;
@@ -286,11 +369,35 @@ function render() {
 
 }
 
+/** Copy of `grid` with outside (null) cells next to the panel filled from
+ *  their neighbours, two cells deep. */
+function fillOutside(grid: (number | null)[], n: number): (number | null)[] {
+  let cur = grid.slice();
+  for (let pass = 0; pass < 2; pass++) {
+    const next = cur.slice();
+    for (let i = 0; i < n * n; i++) {
+      if (cur[i] !== null) continue;
+      const row = Math.floor(i / n), col = i % n;
+      let sum = 0, count = 0;
+      for (const [dr, dc] of [[-1, 0], [1, 0], [0, -1], [0, 1]]) {
+        const r = row + dr, c = col + dc;
+        if (r < 0 || c < 0 || r >= n || c >= n) continue;
+        const v = cur[r * n + c];
+        if (v !== null) { sum += v; count++; }
+      }
+      if (count) next[i] = sum / count;
+    }
+    cur = next;
+  }
+  return cur;
+}
+
 // Traces the zero contour of a mode shape (its node lines) with marching
-// squares. `shape` is n×n, row-major, sampled at cell centres.
+// squares. `shape` is n×n, row-major, sampled at cell centres; null cells
+// (outside the panel) are skipped.
 function drawNodeLines(
   ctx: CanvasRenderingContext2D,
-  shape: number[], n: number,
+  shape: (number | null)[], n: number,
   ox: number, oy: number,
   pw: number, ph: number,
 ) {
@@ -301,10 +408,12 @@ function drawNodeLines(
 
   const px = (col: number) => ox + ((col + 0.5) / n) * pw;
   const py = (row: number) => oy + ((row + 0.5) / n) * ph;
-  const at = (row: number, col: number) => shape[row * n + col];
+  const at = (row: number, col: number) => shape[row * n + col] as number;
 
   for (let row = 0; row < n - 1; row++) {
     for (let col = 0; col < n - 1; col++) {
+      if ([shape[row * n + col], shape[row * n + col + 1], shape[(row + 1) * n + col], shape[(row + 1) * n + col + 1]]
+        .some((v) => v === null)) continue;
       // Corners clockwise from top-left, and the edges between them.
       const corners: [number, number][] = [[row, col], [row, col + 1], [row + 1, col + 1], [row + 1, col]];
       const crossings: [number, number][] = [];
@@ -334,6 +443,14 @@ function drawNodeLines(
 
 function getParams(): PanelParams {
   return {
+    shape:     selectShape.value,
+    corner_r:  Math.max(0, parseFloat(inputCornerR.value) || 0) / 1000,
+    sides:     Math.min(64, Math.max(3, parseInt(inputSides.value) || 6)),
+    custom_path: selectShape.value === "custom" ? toPath(editor.anchors) : null,
+    cutouts:   cutouts.map((c) => c.kind === "hole"
+      ? { ...c, x: c.x / 1000, y: c.y / 1000, d: c.d / 1000 }
+      : { ...c, x: c.x / 1000, y: c.y / 1000, length: c.length / 1000, width: c.width / 1000 }),
+    stiffeners: stiffeners.map(stiffenerParams),
     lx:        parseFloat(inputLx.value) / 1000,
     ly:        parseFloat(inputLy.value) / 1000,
     h:         parseFloat(inputH.value)  / 1000,
@@ -366,15 +483,42 @@ function syncIsotropic() {
   }
 }
 
-function setStatus(state: "calculating" | "done" | "error", msg: string) {
+function setStatus(state: "calculating" | "done" | "error" | "stale", msg: string) {
   statusText.className = state;
   statusText.textContent = msg;
 }
 
-async function calculate() {
-  const id = ++requestId;
-  setStatus("calculating", "Calculating…");
+// Edits bump editVersion; a solve records the version it used, so edits
+// made while it runs leave the result marked out of date.
+let editVersion = 0;
+const solveBtn   = $("solve-btn") as HTMLButtonElement;
+const autoSolve  = $("auto-solve") as HTMLInputElement;
 
+function markStale() {
+  solveBtn.classList.add("stale");
+  canvasWrap.classList.add("stale");
+  setStatus("stale", "Changed · press Solve");
+}
+
+async function calculate() {
+  if (calcTimer) clearTimeout(calcTimer);
+  const id = ++requestId;
+  const version = editVersion;
+  solveBtn.disabled = true;
+  solveBtn.classList.remove("stale");
+  canvasWrap.classList.remove("stale");
+  setStatus("calculating", "Solving…");
+  try {
+    await solve(id);
+  } finally {
+    if (id === requestId) {
+      solveBtn.disabled = false;
+      if (editVersion !== version) markStale();
+    }
+  }
+}
+
+async function solve(id: number) {
   const params = getParams();
 
   if (
@@ -402,10 +546,11 @@ async function calculate() {
     if (id !== requestId) return;
     render();
     updateCharts();
+    const solver = result.solver === "fea" ? " · FEA" : "";
     if (result.truncated_above !== null) {
-      setStatus("done", `Modes above ${Math.round(result.truncated_above)} Hz omitted (solver limit)`);
+      setStatus("done", `Modes above ${Math.round(result.truncated_above)} Hz omitted (solver limit)${solver}`);
     } else {
-      setStatus("done", "Ready");
+      setStatus("done", `Ready${solver}`);
     }
   } catch (err) {
     if (id !== requestId) return;
@@ -480,10 +625,37 @@ function updateCharts() {
     : `${gaps} empty band${gaps === 1 ? "" : "s"}`;
 }
 
+/** Called on every settings change. Solves after a short pause with
+ *  Auto-solve on; otherwise marks the result out of date. */
 function scheduleCalculate() {
+  editVersion++;
   if (calcTimer) clearTimeout(calcTimer);
-  calcTimer = setTimeout(calculate, 250);
+  if (autoSolve.checked) {
+    calcTimer = setTimeout(calculate, 400);
+  } else if (!solveBtn.disabled) {
+    markStale();
+  }
 }
+
+solveBtn.addEventListener("click", () => calculate());
+
+// Enter in any sidebar field solves.
+document.querySelector(".sidebar")!.addEventListener("keydown", (e) => {
+  const ev = e as KeyboardEvent;
+  if (ev.key === "Enter" && (ev.target as HTMLElement).tagName === "INPUT") {
+    ev.preventDefault();
+    calculate();
+  }
+});
+
+// Remember the Auto-solve choice per viewer (storage may be unavailable).
+try {
+  autoSolve.checked = localStorage.getItem("autoSolve") === "1";
+} catch { /* default off */ }
+autoSolve.addEventListener("change", () => {
+  try { localStorage.setItem("autoSolve", autoSolve.checked ? "1" : "0"); } catch { /* ignore */ }
+  if (autoSolve.checked && solveBtn.classList.contains("stale")) calculate();
+});
 
 function updateUI(result: CalculationResult, params: PanelParams) {
   // Optimal position
@@ -500,13 +672,13 @@ function updateUI(result: CalculationResult, params: PanelParams) {
   badgeModes.textContent = `${result.mode_count} modes`;
 
   // Free-plate labels count node lines and are approximate; many modes mix
-  // several patterns.
+  // several patterns. FEA modes (non-rectangular shapes) have no label.
   const approx = params.boundary === "free" ? "≈" : "";
-  const label = (m: ModeInfo) => `${approx}(${m.m},${m.n})`;
+  const label = (m: ModeInfo) => (m.m === null ? "" : `${approx}(${m.m},${m.n})`);
 
   // Lowest frequency
   if (result.modes.length > 0) {
-    valF1.textContent = `${result.modes[0].freq.toFixed(1)} Hz  ${label(result.modes[0])}`;
+    valF1.textContent = `${result.modes[0].freq.toFixed(1)} Hz  ${label(result.modes[0])}`.trim();
   } else {
     valF1.textContent = "—";
   }
@@ -518,7 +690,7 @@ function updateUI(result: CalculationResult, params: PanelParams) {
     const m = result.modes[i];
     const opt = document.createElement("option");
     opt.value = String(i);
-    opt.textContent = `${i + 1}. ${label(m)}  ${m.freq.toFixed(0)} Hz`;
+    opt.textContent = `${i + 1}. ${label(m)}  ${m.freq.toFixed(0)} Hz`.replace(/\s+/g, " ");
     selectMode.appendChild(opt);
   }
   selectedModeIdx = prev < result.modes.length ? prev : -1;
@@ -559,6 +731,10 @@ function canvasToPanel(
 }
 
 canvas.addEventListener("mousemove", (e) => {
+  if (editor.active) {
+    tooltip.classList.remove("visible");
+    return;
+  }
   const pos = canvasToPanel(e.clientX, e.clientY);
   if (!pos || !lastResult) {
     tooltip.classList.remove("visible");
@@ -567,17 +743,21 @@ canvas.addEventListener("mousemove", (e) => {
   }
 
   const { normX, normY, x, y } = pos;
-  const { grid, grid_n } = lastResult;
+  const { grid, grid_n, region } = lastResult;
   const col = Math.min(Math.floor(normX * grid_n), grid_n - 1);
   const row = Math.min(Math.floor(normY * grid_n), grid_n - 1);
-  const normScore = grid[row * grid_n + col];
+  const cell = row * grid_n + col;
+  if (region[cell] === REGION_OUTSIDE) {
+    tooltip.classList.remove("visible");
+    valCursor.textContent = "—";
+    return;
+  }
+  const normScore = grid[cell] ?? 0;
 
   valCursor.textContent = `${x.toFixed(1)} × ${y.toFixed(1)} mm`;
 
-  const inMargin =
-    normX < lastResult.margin_x || normX > 1 - lastResult.margin_x ||
-    normY < lastResult.margin_y || normY > 1 - lastResult.margin_y;
-  const raw = lastResult.grid_raw[row * grid_n + col];
+  const inMargin = region[cell] === REGION_MARGIN;
+  const raw = lastResult.grid_raw[cell] ?? 0;
   const scoreText = inMargin
     ? "edge margin"
     : lastParams?.score === "coupling"
@@ -595,8 +775,12 @@ canvas.addEventListener("mousemove", (e) => {
 });
 
 canvas.addEventListener("click", async (e) => {
+  if (editor.active) return;
   const pos = canvasToPanel(e.clientX, e.clientY);
-  if (!pos || !lastParams) return;
+  if (!pos || !lastParams || !lastResult) return;
+  const n = lastResult.grid_n;
+  const cell = Math.min(Math.floor(pos.normY * n), n - 1) * n + Math.min(Math.floor(pos.normX * n), n - 1);
+  if (lastResult.region[cell] === REGION_OUTSIDE) return;
   probe = { x: pos.normX, y: pos.normY, db: [], raggedness: 0 };
   const id = requestId;
   await loadProbe();
@@ -613,7 +797,7 @@ canvas.addEventListener("mouseleave", () => {
 // ── Input listeners ───────────────────────────────────────────────────────────
 
 const numericInputs = [
-  inputLx, inputLy, inputH, inputEx, inputEy, inputG, inputRho, inputNu,
+  inputCornerR, inputSides, inputLx, inputLy, inputH, inputEx, inputEy, inputG, inputRho, inputNu,
   inputFreqMax, inputExciterD, inputEta, inputGridN,
 ];
 numericInputs.forEach((el) => el.addEventListener("input", scheduleCalculate));
@@ -625,6 +809,249 @@ checkIsotropic.addEventListener("change", () => {
 });
 
 selectBoundary.addEventListener("change", scheduleCalculate);
+
+// ── Custom outline ───────────────────────────────────────────────────────────
+
+const editor = new OutlineEditor(
+  canvas,
+  () => panelFrame,
+  () => scheduleCalculate(),
+  () => render(),
+);
+const editOutlineBtn = $("edit-outline") as HTMLButtonElement;
+
+// The last built-in shape, which a new custom outline starts from.
+let lastBuiltinShape = selectShape.value;
+
+function setEditing(on: boolean) {
+  editor.setActive(on);
+  editOutlineBtn.classList.toggle("active", on);
+  editOutlineBtn.textContent = on ? "Done editing" : "Edit outline";
+  $("outline-hint").hidden = !on;
+}
+editOutlineBtn.addEventListener("click", () => setEditing(!editor.active));
+
+// Shape-specific fields.
+function syncShapeFields() {
+  const shape = selectShape.value;
+  $("field-corner-r").hidden = shape !== "rounded_rectangle";
+  $("field-sides").hidden = shape !== "polygon";
+  $("shape-hint").hidden = shape === "rectangle";
+  editOutlineBtn.hidden = shape !== "custom";
+  if (shape !== "custom" && editor.active) setEditing(false);
+}
+/** A stiffener in SI units, with its material resolved. "Same as panel"
+ *  takes the panel's stiffness along the rib's direction. */
+function stiffenerParams(s: Stiffener): StiffenerParams {
+  let { e, g, rho } = RIB_MATERIALS[s.material];
+  if (s.material === "panel") {
+    const ex = parseFloat(inputEx.value), ey = parseFloat(inputEy.value);
+    const gp = parseFloat(inputG.value), nu = parseFloat(inputNu.value);
+    const a = Math.atan2(s.y2 - s.y1, s.x2 - s.x1);
+    const c2 = Math.cos(a) ** 2, s2 = Math.sin(a) ** 2;
+    e = 1 / (c2 * c2 / ex + s2 * s2 / ey + c2 * s2 * (1 / gp - 2 * nu / ex));
+    g = gp;
+    rho = parseFloat(inputRho.value);
+  }
+  return {
+    x1: s.x1 / 1000, y1: s.y1 / 1000, x2: s.x2 / 1000, y2: s.y2 / 1000,
+    width: s.width / 1000, height: s.height / 1000,
+    e: e * 1e6, g: g * 1e6, rho,
+  };
+}
+
+// ── Cutouts ──────────────────────────────────────────────────────────────────
+
+const cutoutList = $("cutout-list");
+
+type CutoutField = { key: string; label: string; unit: string; step: number };
+const CUTOUT_FIELDS: Record<Cutout["kind"], CutoutField[]> = {
+  hole: [
+    { key: "x", label: "X", unit: "mm", step: 1 },
+    { key: "y", label: "Y", unit: "mm", step: 1 },
+    { key: "d", label: "Diameter", unit: "mm", step: 1 },
+  ],
+  slot: [
+    { key: "x", label: "X", unit: "mm", step: 1 },
+    { key: "y", label: "Y", unit: "mm", step: 1 },
+    { key: "length", label: "Length", unit: "mm", step: 1 },
+    { key: "width", label: "Width", unit: "mm", step: 0.5 },
+    { key: "angle", label: "Angle (clockwise)", unit: "°", step: 5 },
+  ],
+};
+
+function renderCutouts() {
+  cutoutList.innerHTML = "";
+  cutouts.forEach((c, i) => {
+    const card = document.createElement("div");
+    card.className = "cutout-card";
+    const header = document.createElement("header");
+    header.textContent = `${c.kind === "hole" ? "Hole" : "Slot"} ${i + 1}`;
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.textContent = "×";
+    remove.title = "Remove this cutout";
+    remove.addEventListener("click", () => {
+      cutouts.splice(i, 1);
+      renderCutouts();
+      scheduleCalculate();
+    });
+    header.appendChild(remove);
+    card.appendChild(header);
+
+    for (const f of CUTOUT_FIELDS[c.kind]) {
+      const label = document.createElement("label");
+      label.textContent = f.label;
+      const wrap = document.createElement("div");
+      wrap.className = "input-with-unit";
+      const input = document.createElement("input");
+      input.type = "number";
+      input.step = String(f.step);
+      input.value = String((c as Record<string, number | string>)[f.key]);
+      input.addEventListener("input", () => {
+        const v = parseFloat(input.value);
+        if (!isNaN(v)) {
+          (c as Record<string, number | string>)[f.key] = v;
+          scheduleCalculate();
+        }
+      });
+      const unit = document.createElement("span");
+      unit.className = "unit";
+      unit.textContent = f.unit;
+      wrap.append(input, unit);
+      label.appendChild(wrap);
+      card.appendChild(label);
+    }
+    cutoutList.appendChild(card);
+  });
+}
+
+function addCutout(kind: Cutout["kind"]) {
+  const w = parseFloat(inputLx.value) || 300;
+  const h = parseFloat(inputLy.value) || 200;
+  // Start somewhere plausible; the user positions it from there.
+  cutouts.push(kind === "hole"
+    ? { kind, x: Math.round(w * 0.3), y: Math.round(h * 0.5), d: Math.round(Math.min(w, h) * 0.1) }
+    : { kind, x: Math.round(w * 0.5), y: Math.round(h * 0.5), length: Math.round(h * 0.5), width: 8, angle: 90 });
+  probe = null;
+  renderCutouts();
+  scheduleCalculate();
+}
+
+$("add-hole").addEventListener("click", () => addCutout("hole"));
+
+// ── Stiffeners ───────────────────────────────────────────────────────────────
+
+const stiffenerList = $("stiffener-list");
+
+const STIFFENER_FIELDS: CutoutField[] = [
+  { key: "x1", label: "Start X", unit: "mm", step: 1 },
+  { key: "y1", label: "Start Y", unit: "mm", step: 1 },
+  { key: "x2", label: "End X", unit: "mm", step: 1 },
+  { key: "y2", label: "End Y", unit: "mm", step: 1 },
+  { key: "width", label: "Width", unit: "mm", step: 0.5 },
+  { key: "height", label: "Height", unit: "mm", step: 0.5 },
+];
+
+function renderStiffeners() {
+  stiffenerList.innerHTML = "";
+  stiffeners.forEach((s, i) => {
+    const card = document.createElement("div");
+    card.className = "cutout-card";
+    const header = document.createElement("header");
+    header.textContent = `Rib ${i + 1}`;
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.textContent = "×";
+    remove.title = "Remove this rib";
+    remove.addEventListener("click", () => {
+      stiffeners.splice(i, 1);
+      renderStiffeners();
+      render();
+      scheduleCalculate();
+    });
+    header.appendChild(remove);
+    card.appendChild(header);
+
+    for (const f of STIFFENER_FIELDS) {
+      const label = document.createElement("label");
+      label.textContent = f.label;
+      const wrap = document.createElement("div");
+      wrap.className = "input-with-unit";
+      const input = document.createElement("input");
+      input.type = "number";
+      input.step = String(f.step);
+      input.value = String((s as unknown as Record<string, number>)[f.key]);
+      input.addEventListener("input", () => {
+        const v = parseFloat(input.value);
+        if (!isNaN(v)) {
+          (s as unknown as Record<string, number>)[f.key] = v;
+          render();
+          scheduleCalculate();
+        }
+      });
+      const unit = document.createElement("span");
+      unit.className = "unit";
+      unit.textContent = f.unit;
+      wrap.append(input, unit);
+      label.appendChild(wrap);
+      card.appendChild(label);
+    }
+
+    const matLabel = document.createElement("label");
+    matLabel.className = "full";
+    matLabel.textContent = "Material";
+    const select = document.createElement("select");
+    for (const [key, m] of Object.entries(RIB_MATERIALS)) {
+      const opt = document.createElement("option");
+      opt.value = key;
+      opt.textContent = m.label;
+      select.appendChild(opt);
+    }
+    select.value = s.material;
+    select.addEventListener("change", () => {
+      s.material = select.value as Stiffener["material"];
+      scheduleCalculate();
+    });
+    matLabel.appendChild(select);
+    card.appendChild(matLabel);
+    stiffenerList.appendChild(card);
+  });
+}
+
+$("add-stiffener").addEventListener("click", () => {
+  const w = parseFloat(inputLx.value) || 300;
+  const h = parseFloat(inputLy.value) || 200;
+  // A bass-bar-like default: along the width, a little off-centre.
+  stiffeners.push({
+    x1: Math.round(w * 0.15), y1: Math.round(h * 0.35),
+    x2: Math.round(w * 0.85), y2: Math.round(h * 0.35),
+    width: 5, height: 8, material: "spruce",
+  });
+  renderStiffeners();
+  render();
+  scheduleCalculate();
+});
+$("add-slot").addEventListener("click", () => addCutout("slot"));
+
+selectShape.addEventListener("change", () => {
+  if (selectShape.value === "custom") {
+    // Start from the shape that was showing, so nothing is drawn from scratch.
+    editor.setAnchors(anchorsFromShape(
+      lastBuiltinShape,
+      parseFloat(inputLx.value) || 300,
+      parseFloat(inputLy.value) || 200,
+      parseFloat(inputCornerR.value) || 0,
+      parseInt(inputSides.value) || 6,
+    ));
+    setEditing(true);
+  } else {
+    lastBuiltinShape = selectShape.value;
+  }
+  syncShapeFields();
+  probe = null;  // a clicked position may not be on the new shape
+  scheduleCalculate();
+});
 selectScore.addEventListener("change", scheduleCalculate);
 
 selectMaterial.addEventListener("change", () => {
@@ -665,5 +1092,6 @@ chartObserver.observe($("chart-panel"));
 
 window.addEventListener("DOMContentLoaded", () => {
   syncIsotropic();
+  syncShapeFields();
   calculate();
 });

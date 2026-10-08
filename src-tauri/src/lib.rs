@@ -1,8 +1,14 @@
+mod fem;
+mod geometry;
+mod mesh;
+mod model;
 mod plate;
 mod response;
 
+use geometry::{Cutout, Panel, Path, Pt, Stiffener};
+use model::{Discretisation, Model, ModelKey};
 use nalgebra::DMatrix;
-use plate::{Boundary, GridBasis, PointBasis, Plate, SolveKey, Solution};
+use plate::{Boundary, Plate};
 use response::Bands;
 use serde::{Deserialize, Serialize};
 use std::f64::consts::PI;
@@ -10,6 +16,15 @@ use std::sync::{Arc, Mutex};
 
 #[derive(Deserialize, Clone)]
 pub struct PanelParams {
+    pub shape: String,    // "rectangle" | "rounded_rectangle" | "ellipse" | "polygon"
+    pub corner_r: f64,    // rounded-rectangle corner radius [m]
+    pub sides: usize,     // polygon side count
+    #[serde(default)]
+    pub custom_path: Option<Path>,  // "custom" outline, normalised to the box
+    #[serde(default)]
+    pub cutouts: Vec<Cutout>,  // holes and slots, positions in metres
+    #[serde(default)]
+    pub stiffeners: Vec<Stiffener>,  // bonded ribs, metres / Pa / kg/m³
     pub lx: f64,          // panel width  [m]
     pub ly: f64,          // panel height [m]
     pub h: f64,           // thickness    [m]
@@ -28,37 +43,45 @@ pub struct PanelParams {
 
 #[derive(Serialize, Clone)]
 pub struct ModeInfo {
-    pub m: u32,
-    pub n: u32,
+    // Nodal-line counts; absent for shapes where they aren't meaningful.
+    pub m: Option<u32>,
+    pub n: Option<u32>,
     pub freq: f64,
 }
 
+// Grid cell classes for the heat map.
+const REGION_SEARCH: u8 = 0;   // candidate exciter position
+const REGION_MARGIN: u8 = 1;   // on the panel, too close to an edge
+const REGION_OUTSIDE: u8 = 2;  // not panel material
+
 #[derive(Serialize)]
 pub struct CalculationResult {
-    // Row-major NxN, normalised so the interior search region spans [0, 1]
-    // with 1 = best; cells inside the edge margin can fall outside that range.
+    // Row-major NxN over the bounding box, normalised so the search region
+    // spans [0, 1] with 1 = best. Null (NaN) outside the panel.
     pub grid: Vec<f64>,
     // The same cells in the score's own units: raggedness in dB (lower is
     // better) or summed coupling (higher is better).
     pub grid_raw: Vec<f64>,
+    pub region: Vec<u8>,     // per cell: 0 search, 1 edge margin, 2 outside
     pub grid_n: usize,
+    // Outline and hole rings in normalised coordinates, for drawing.
+    pub outline: Vec<Vec<Pt>>,
     pub modes: Vec<ModeInfo>,
     pub mode_count: usize,
     pub optimal_x: f64,      // normalised [0, 1]
     pub optimal_y: f64,
     pub optimal_score_raw: f64,
-    pub margin_x: f64,       // edge margin excluded from the search, normalised
-    pub margin_y: f64,
     pub bands: Vec<f64>,         // response band centres [Hz]
     pub response_opt: Vec<f64>,  // response at the optimal position [dB]
     pub raggedness_opt: f64,     // its raggedness [dB]
+    pub solver: &'static str,    // "analytic" | "fea"
     // Set when the solver could not resolve modes all the way to freq_max;
     // modes above this frequency are omitted.
     pub truncated_above: Option<f64>,
 }
 
 impl PanelParams {
-    fn key(&self) -> Result<SolveKey, String> {
+    fn key(&self) -> Result<ModelKey, String> {
         let plate = Plate {
             lx: self.lx,
             ly: self.ly,
@@ -78,42 +101,60 @@ impl PanelParams {
             "simply_supported" => Boundary::SimplySupported,
             other => return Err(format!("Unknown boundary condition: {other}")),
         };
+        let panel = match self.shape.as_str() {
+            "rectangle" => Panel::Rectangle,
+            // A zero radius is just a rectangle; use the faster exact solver.
+            "rounded_rectangle" if self.corner_r <= 0.0 => Panel::Rectangle,
+            "rounded_rectangle" => Panel::RoundedRectangle { radius: self.corner_r },
+            "ellipse" => Panel::Ellipse,
+            "polygon" => Panel::Polygon { sides: self.sides.clamp(3, 64) },
+            "custom" => Panel::Custom(self.custom_path.clone().ok_or("No custom outline was given")?),
+            other => return Err(format!("Unknown shape: {other}")),
+        };
         // Resolve modes somewhat above freq_max, so the response near the top
         // of the band includes the tails of the modes just beyond it.
-        Ok(SolveKey::for_freq(plate, boundary, self.freq_max * RESPONSE_HEADROOM))
+        Ok(ModelKey::for_freq(
+            plate,
+            boundary,
+            panel,
+            self.cutouts.clone(),
+            self.stiffeners.clone(),
+            self.freq_max * RESPONSE_HEADROOM,
+        ))
     }
 
-    fn margins(&self) -> (f64, f64) {
-        // Optimal search excludes a 10% edge margin (widened if needed to keep
-        // the whole exciter on the panel). Free edges always move a lot, and
-        // edges and corners are impractical mounting locations.
+    /// Minimum distances from the outer edge and from cutout edges for a
+    /// candidate exciter position. The panel's outer free edges move far more
+    /// than the interior and are impractical mounting locations, so they get
+    /// a wide margin; near a cutout the exciter just needs to fit.
+    fn edge_margins(&self) -> (f64, f64) {
         const EDGE_MARGIN: f64 = 0.10;
+        const CUTOUT_CLEARANCE: f64 = 0.003;
         let radius = self.exciter_d.max(0.0) / 2.0;
-        (EDGE_MARGIN.max(radius / self.lx), EDGE_MARGIN.max(radius / self.ly))
+        ((EDGE_MARGIN * self.lx.min(self.ly)).max(radius), radius + CUTOUT_CLEARANCE)
     }
 }
 
 const RESPONSE_HEADROOM: f64 = 1.3;
 
 /// Everything needed to evaluate the response at any exciter position.
-struct ResponseModel<'a> {
-    modes: &'a [plate::Mode],
+struct ResponseModel {
+    mode_count: usize,
     bands: Bands,
     transfer: DMatrix<f64>,  // modes × bands
 }
 
-impl<'a> ResponseModel<'a> {
-    fn new(sol: &'a Solution, params: &PanelParams) -> ResponseModel<'a> {
-        let count = sol.modes.partition_point(|m| m.freq <= params.freq_max * RESPONSE_HEADROOM);
-        let modes = &sol.modes[..count];
+impl ResponseModel {
+    fn new(model: &Model, params: &PanelParams) -> ResponseModel {
+        let mode_count = model.modes.partition_point(|m| m.freq <= params.freq_max * RESPONSE_HEADROOM);
         // From just below the first mode to freq_max, or lower if the solver
         // ran out of resolution.
-        let f_start = modes.first().map_or(params.freq_max, |m| m.freq * 2f64.powf(-1.0 / 24.0));
-        let f_end = params.freq_max.min(sol.freq_limit / RESPONSE_HEADROOM);
+        let f_start = model.modes.first().map_or(params.freq_max, |m| m.freq * 2f64.powf(-1.0 / 24.0));
+        let f_end = params.freq_max.min(model.freq_limit / RESPONSE_HEADROOM);
         let bands = Bands::new(f_start, f_end);
-        let freqs: Vec<f64> = modes.iter().map(|m| m.freq).collect();
+        let freqs: Vec<f64> = model.modes[..mode_count].iter().map(|m| m.freq).collect();
         let transfer = response::transfer(&freqs, params.eta, &bands);
-        ResponseModel { modes, bands, transfer }
+        ResponseModel { mode_count, bands, transfer }
     }
 
     /// Response (dB) for an exciter with the given modal couplings.
@@ -124,49 +165,58 @@ impl<'a> ResponseModel<'a> {
         response::to_db(&power)
     }
 
-    /// Response at a normalised panel position, evaluating mode shapes exactly
-    /// around the voice-coil ring rather than interpolating the grid.
-    fn curve_at(&self, sol: &Solution, params: &PanelParams, x: f64, y: f64) -> Vec<f64> {
+    /// Response at a normalised panel position, evaluating mode shapes
+    /// directly around the voice-coil ring rather than interpolating the grid.
+    fn curve_at(&self, model: &Model, params: &PanelParams, x: f64, y: f64) -> Vec<f64> {
         let radius = params.exciter_d.max(0.0) / 2.0;
-        let points: Vec<(f64, f64)> = if radius > 0.0 {
+        let points: Vec<Pt> = if radius > 0.0 {
             (0..RING_POINTS).map(|k| {
                 let theta = 2.0 * PI * k as f64 / RING_POINTS as f64;
-                (
+                [
                     (x + radius * theta.cos() / params.lx).clamp(0.0, 1.0),
                     (y + radius * theta.sin() / params.ly).clamp(0.0, 1.0),
-                )
+                ]
             }).collect()
         } else {
-            vec![(x, y)]
+            vec![[x, y]]
         };
-        let basis = PointBasis::new(sol, points);
-        let couplings: Vec<f64> = self.modes.iter()
-            .map(|m| {
-                let w = basis.eval(sol, m);
-                w.iter().sum::<f64>() / w.len() as f64
-            })
+        let eval = model.point_eval(points);
+        let couplings: Vec<f64> = (0..self.mode_count)
+            .map(|k| finite_mean(eval.eval(k).iter().map(|&v| (v, 1.0))))
             .collect();
         self.curve(&couplings)
     }
 }
 
-// The eigen-solve depends only on the panel, not on the grid or exciter, so
-// keep the last one for re-scoring and mode overlays.
-static CACHE: Mutex<Option<Arc<Solution>>> = Mutex::new(None);
-
-fn solve_cached(key: SolveKey) -> Arc<Solution> {
-    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(sol) = cache.as_ref().filter(|s| s.key == key) {
-        return sol.clone();
+/// Weighted mean over the finite values only (ring points that fall off the
+/// panel are skipped). NaN if none are finite.
+fn finite_mean(values: impl Iterator<Item = (f64, f64)>) -> f64 {
+    let (mut sum, mut weight) = (0.0, 0.0);
+    for (v, w) in values {
+        if v.is_finite() {
+            sum += w * v;
+            weight += w;
+        }
     }
-    let sol = Arc::new(plate::solve(key));
-    *cache = Some(sol.clone());
-    sol
+    if weight > 0.0 { sum / weight } else { f64::NAN }
 }
 
-fn modes_in_range(sol: &Solution, freq_max: f64) -> &[plate::Mode] {
-    let count = sol.modes.partition_point(|m| m.freq <= freq_max);
-    &sol.modes[..count]
+// The eigen-solve depends only on the panel, not on the grid or exciter, so
+// keep the last one for re-scoring and mode overlays.
+static CACHE: Mutex<Option<Arc<Model>>> = Mutex::new(None);
+
+fn solve_cached(key: ModelKey) -> Result<Arc<Model>, String> {
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(model) = cache.as_ref().filter(|m| m.key == key) {
+        return Ok(model.clone());
+    }
+    let model = Arc::new(Model::solve(key)?);
+    *cache = Some(model.clone());
+    Ok(model)
+}
+
+fn modes_in_range(model: &Model, freq_max: f64) -> usize {
+    model.modes.partition_point(|m| m.freq <= freq_max)
 }
 
 // Bilinear sample taps for the exciter's voice-coil ring around each grid
@@ -186,7 +236,7 @@ fn ring_stencil(n: usize, rx: f64, ry: f64) -> Vec<Vec<(usize, f64)>> {
             let mut taps = Vec::with_capacity(RING_POINTS * 4);
             for k in 0..RING_POINTS {
                 let theta = 2.0 * PI * k as f64 / RING_POINTS as f64;
-                // Grid coordinates (cell centres at integers), clamped to the panel.
+                // Grid coordinates (cell centres at integers), clamped to the box.
                 let gx = (col as f64 + rx * n as f64 * theta.cos()).clamp(0.0, max);
                 let gy = (row as f64 + ry * n as f64 * theta.sin()).clamp(0.0, max);
                 let (x0, y0) = (gx.floor() as usize, gy.floor() as usize);
@@ -205,45 +255,76 @@ fn ring_stencil(n: usize, rx: f64, ry: f64) -> Vec<Vec<(usize, f64)>> {
 
 #[tauri::command(async)]
 fn compute_heatmap(params: PanelParams) -> Result<CalculationResult, String> {
-    let sol = solve_cached(params.key()?);
-    let modes = modes_in_range(&sol, params.freq_max);
-    let mode_count = modes.len();
+    let model = solve_cached(params.key()?)?;
+    let mode_count = modes_in_range(&model, params.freq_max);
     let n = params.grid_n.clamp(4, 100);
-    let truncated_above = (sol.freq_limit < params.freq_max).then_some(sol.freq_limit);
-    let (margin_x, margin_y) = params.margins();
+    let truncated_above = (model.freq_limit < params.freq_max).then_some(model.freq_limit);
     let flatness = params.score != "coupling";
+    let solver = match model.key.disc {
+        Discretisation::Analytic(_) => "analytic",
+        Discretisation::Fea { .. } => "fea",
+    };
 
-    let mode_infos = modes.iter().map(|m| ModeInfo { m: m.m, n: m.n, freq: m.freq }).collect();
+    let modes = model.modes[..mode_count].iter()
+        .map(|m| ModeInfo { m: m.label.map(|l| l.0), n: m.label.map(|l| l.1), freq: m.freq })
+        .collect();
+    let outline = model.outline.rings().iter()
+        .map(|ring| ring.iter().map(|p| [p[0] / params.lx, p[1] / params.ly]).collect())
+        .collect();
 
+    // Classify grid cells by position relative to the panel edges.
+    let (outer_margin, cutout_margin) = params.edge_margins();
+    let region: Vec<u8> = (0..n * n).map(|i| {
+        let p = [((i % n) as f64 + 0.5) / n as f64 * params.lx, ((i / n) as f64 + 0.5) / n as f64 * params.ly];
+        if !model.outline.contains(p) {
+            return REGION_OUTSIDE;
+        }
+        let (outer, holes) = model.outline.distance_to_outline_and_holes(p);
+        if outer < outer_margin || holes < cutout_margin {
+            REGION_MARGIN
+        } else {
+            REGION_SEARCH
+        }
+    }).collect();
+
+    let empty = |grid: Vec<f64>| CalculationResult {
+        grid: grid.clone(),
+        grid_raw: grid,
+        region: region.clone(),
+        grid_n: n,
+        outline: Vec::new(),
+        modes: Vec::new(),
+        mode_count: 0,
+        optimal_x: 0.5,
+        optimal_y: 0.5,
+        optimal_score_raw: 0.0,
+        bands: Vec::new(),
+        response_opt: Vec::new(),
+        raggedness_opt: 0.0,
+        solver,
+        truncated_above,
+    };
     if mode_count == 0 {
-        return Ok(CalculationResult {
-            grid: vec![0.0; n * n],
-            grid_raw: vec![0.0; n * n],
-            grid_n: n,
-            modes: mode_infos,
-            mode_count: 0,
-            optimal_x: 0.5,
-            optimal_y: 0.5,
-            optimal_score_raw: 0.0,
-            margin_x,
-            margin_y,
-            bands: Vec::new(),
-            response_opt: Vec::new(),
-            raggedness_opt: 0.0,
-            truncated_above,
-        });
+        let grid = region.iter().map(|&r| if r == REGION_OUTSIDE { f64::NAN } else { 0.0 }).collect();
+        return Ok(CalculationResult { outline, modes, ..empty(grid) });
     }
 
     // --- Couplings: each mode's shape averaged around the voice-coil ring ---
-    let model = ResponseModel::new(&sol, &params);
+    let response_model = ResponseModel::new(&model, &params);
     let radius = params.exciter_d.max(0.0) / 2.0;
     let stencil = ring_stencil(n, radius / params.lx, radius / params.ly);
-    let basis = GridBasis::new(&sol, n);
-    let mut couplings = DMatrix::<f64>::zeros(n * n, model.modes.len());
-    for (k, mode) in model.modes.iter().enumerate() {
-        let shape = basis.eval(&sol, mode);
+    let eval = model.grid_eval(n);
+    let mut couplings = DMatrix::<f64>::zeros(n * n, response_model.mode_count);
+    for k in 0..response_model.mode_count {
+        let shape = eval.eval(k);
         for (cell, taps) in stencil.iter().enumerate() {
-            couplings[(cell, k)] = taps.iter().map(|&(i, w)| w * shape[i]).sum();
+            couplings[(cell, k)] = if region[cell] == REGION_OUTSIDE {
+                0.0
+            } else {
+                // Ring taps off the panel are skipped.
+                let c = finite_mean(taps.iter().map(|&(i, w)| (shape[i], w)));
+                if c.is_finite() { c } else { 0.0 }
+            };
         }
     }
 
@@ -251,79 +332,105 @@ fn compute_heatmap(params: PanelParams) -> Result<CalculationResult, String> {
     // Flatness: raggedness of the damped response (lower is better).
     // Coupling: sum of |coupling| over modes up to freq_max (higher is better).
     let grid_raw: Vec<f64> = if flatness {
-        let power = couplings.map(|c| c * c) * &model.transfer;  // cells × bands
+        let power = couplings.map(|c| c * c) * &response_model.transfer;  // cells × bands
         (0..n * n)
             .map(|cell| {
+                if region[cell] == REGION_OUTSIDE {
+                    return f64::NAN;
+                }
                 let row: Vec<f64> = power.row(cell).iter().copied().collect();
                 response::raggedness(&response::to_db(&row))
             })
             .collect()
     } else {
         (0..n * n)
-            .map(|cell| (0..mode_count).map(|k| couplings[(cell, k)].abs()).sum())
+            .map(|cell| {
+                if region[cell] == REGION_OUTSIDE {
+                    return f64::NAN;
+                }
+                (0..mode_count).map(|k| couplings[(cell, k)].abs()).sum()
+            })
             .collect()
     };
     // Higher is better for the search and the colour scale.
     let goodness = |raw: f64| if flatness { -raw } else { raw };
 
-    // The colour range comes from the interior only: free edges move far more
-    // than anywhere an exciter can go, and would otherwise flatten the interior.
+    // The colour range comes from the search region only: free edges move far
+    // more than anywhere an exciter can go, and would otherwise flatten it.
     let mut max_score = f64::NEG_INFINITY;
     let mut min_score = f64::INFINITY;
-    let mut opt_x = 0.5f64;
-    let mut opt_y = 0.5f64;
+    let mut opt = None;
     let mut opt_score = f64::NEG_INFINITY;
-    let mut opt_raw = 0.0;
-
-    for row in 0..n {
-        let norm_y = (row as f64 + 0.5) / n as f64;
-        for col in 0..n {
-            let norm_x = (col as f64 + 0.5) / n as f64;
-            let raw = grid_raw[row * n + col];
-            let score = goodness(raw);
-
-            let interior = norm_x >= margin_x && norm_x <= 1.0 - margin_x
-                        && norm_y >= margin_y && norm_y <= 1.0 - margin_y;
-            if !interior {
-                continue;
-            }
-
-            max_score = max_score.max(score);
-            min_score = min_score.min(score);
-            if score > opt_score {
-                opt_score = score;
-                opt_raw = raw;
-                opt_x = norm_x;
-                opt_y = norm_y;
-            }
+    for cell in 0..n * n {
+        if region[cell] != REGION_SEARCH {
+            continue;
+        }
+        let score = goodness(grid_raw[cell]);
+        max_score = max_score.max(score);
+        min_score = min_score.min(score);
+        if score > opt_score {
+            opt_score = score;
+            opt = Some(cell);
         }
     }
+    // A shape too small for the margin has no search region; fall back to
+    // the cell furthest from the edges.
+    let opt = opt.unwrap_or_else(|| {
+        (0..n * n)
+            .filter(|&c| region[c] != REGION_OUTSIDE)
+            .max_by(|&a, &b| {
+                let p = |c: usize| [((c % n) as f64 + 0.5) / n as f64 * params.lx, ((c / n) as f64 + 0.5) / n as f64 * params.ly];
+                model.outline.distance_to_edge(p(a)).total_cmp(&model.outline.distance_to_edge(p(b)))
+            })
+            .unwrap_or(n * n / 2 + n / 2)
+    });
+    let (opt_x, opt_y) = (((opt % n) as f64 + 0.5) / n as f64, ((opt / n) as f64 + 0.5) / n as f64);
 
     // Normalise to [0, 1]
     let range = max_score - min_score;
     let grid = grid_raw.iter()
-        .map(|&raw| if range.is_finite() && range > 1e-12 { (goodness(raw) - min_score) / range } else { 0.5 })
+        .map(|&raw| {
+            if !raw.is_finite() {
+                f64::NAN
+            } else if range.is_finite() && range > 1e-12 {
+                (goodness(raw) - min_score) / range
+            } else {
+                0.5
+            }
+        })
         .collect();
 
-    let response_opt = model.curve_at(&sol, &params, opt_x, opt_y);
+    let response_opt = response_model.curve_at(&model, &params, opt_x, opt_y);
     let raggedness_opt = response::raggedness(&response_opt);
 
     Ok(CalculationResult {
         grid,
+        optimal_score_raw: grid_raw[opt],
         grid_raw,
+        region,
         grid_n: n,
-        modes: mode_infos,
+        outline,
+        modes,
         mode_count,
         optimal_x: opt_x,
         optimal_y: opt_y,
-        optimal_score_raw: opt_raw,
-        margin_x,
-        margin_y,
-        bands: model.bands.centres.clone(),
+        bands: response_model.bands.centres.clone(),
         response_opt,
         raggedness_opt,
+        solver,
         truncated_above,
     })
+}
+
+/// Shape of mode `index` (in the order `compute_heatmap` returned) sampled on
+/// an n×n grid, row-major; null outside the panel. Used to draw node lines.
+#[tauri::command(async)]
+fn mode_shape(params: PanelParams, index: usize, n: usize) -> Result<Vec<f64>, String> {
+    let model = solve_cached(params.key()?)?;
+    if index >= modes_in_range(&model, params.freq_max) {
+        return Err("Mode index out of range".into());
+    }
+    Ok(model.grid_eval(n.clamp(4, 200)).eval(index))
 }
 
 #[derive(Serialize)]
@@ -335,22 +442,15 @@ pub struct ResponseCurve {
 /// Response with the exciter at a normalised panel position (x, y in 0..1).
 #[tauri::command(async)]
 fn response_at(params: PanelParams, x: f64, y: f64) -> Result<ResponseCurve, String> {
-    let sol = solve_cached(params.key()?);
-    let model = ResponseModel::new(&sol, &params);
-    let db = model.curve_at(&sol, &params, x.clamp(0.0, 1.0), y.clamp(0.0, 1.0));
+    let model = solve_cached(params.key()?)?;
+    let p = [x.clamp(0.0, 1.0) * params.lx, y.clamp(0.0, 1.0) * params.ly];
+    if !model.outline.contains(p) {
+        return Err("That position isn't on the panel".into());
+    }
+    let response_model = ResponseModel::new(&model, &params);
+    let db = response_model.curve_at(&model, &params, x.clamp(0.0, 1.0), y.clamp(0.0, 1.0));
     let raggedness = response::raggedness(&db);
     Ok(ResponseCurve { db, raggedness })
-}
-
-/// Shape of mode `index` (in the order `compute_heatmap` returned) sampled on
-/// an n×n grid, row-major. Used to draw node lines.
-#[tauri::command(async)]
-fn mode_shape(params: PanelParams, index: usize, n: usize) -> Result<Vec<f64>, String> {
-    let sol = solve_cached(params.key()?);
-    let mode = modes_in_range(&sol, params.freq_max)
-        .get(index)
-        .ok_or("Mode index out of range")?;
-    Ok(plate::shape_grid(&sol, mode, n.clamp(4, 200)))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -360,4 +460,37 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![compute_heatmap, mode_shape, response_at])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn params() -> PanelParams {
+        PanelParams {
+            shape: "ellipse".into(), corner_r: 0.0, sides: 6, custom_path: None, cutouts: vec![], stiffeners: vec![],
+            lx: 0.3, ly: 0.2, h: 0.003, ex: 3.2e9, ey: 3.2e9, g: 3.2e9 / 2.74, nu: 0.37, rho: 1190.0,
+            boundary: "free".into(), freq_max: 5000.0, grid_n: 60, exciter_d: 0.025, eta: 0.04, score: "flatness".into(),
+        }
+    }
+
+    // Regression: a half-typed width (4 mm) once sent the FEA eigen-solver
+    // after every mode up to the mesh's resolution limit and never returned.
+    #[test]
+    fn half_typed_dimensions_fail_fast() {
+        let t = std::time::Instant::now();
+        let err = compute_heatmap(PanelParams { lx: 0.004, ..params() }).err().unwrap();
+        assert!(err.contains("too small"), "{err}");
+        assert!(t.elapsed().as_millis() < 100);
+    }
+
+    // Regression: a mesh finer than the frequency needs must still only
+    // solve for modes up to the requested frequency.
+    #[test]
+    fn small_panels_solve_only_requested_modes() {
+        let t = std::time::Instant::now();
+        let r = compute_heatmap(PanelParams { lx: 0.045, ..params() }).unwrap();
+        assert!(r.mode_count > 0 && r.modes.iter().all(|m| m.freq <= 5000.0));
+        assert!(t.elapsed().as_secs_f64() < 2.0, "{:?}", t.elapsed());
+    }
 }

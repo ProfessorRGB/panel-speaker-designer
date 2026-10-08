@@ -1,5 +1,7 @@
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
+[hidden] { display: none !important; }
+
 :root {
   --sidebar-w: 264px;
   --bg: #f0f0f0;
@@ -332,6 +334,115 @@ select:focus {
 
 /* Info bar */
 
+/* Cutouts */
+
+.cutout-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.cutout-list:empty {
+  display: none;
+}
+
+.cutout-card {
+  border: 1px solid var(--input-border);
+  border-radius: var(--radius);
+  padding: 6px 8px 8px;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+
+.cutout-card header {
+  grid-column: 1 / -1;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--sidebar-text);
+}
+
+.cutout-card label {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 10px;
+  color: var(--sidebar-muted);
+}
+
+.cutout-card label.full {
+  grid-column: 1 / -1;
+}
+
+.cutout-card select {
+  font-size: 11px;
+  padding: 3px 6px;
+}
+
+.cutout-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.cutout-actions button,
+.cutout-card header button {
+  background: var(--input-bg);
+  border: 1px solid var(--input-border);
+  border-radius: var(--radius);
+  color: var(--sidebar-text);
+  font: inherit;
+  font-size: 11px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+
+.cutout-card header button {
+  padding: 0 6px;
+  line-height: 18px;
+}
+
+.cutout-actions button:hover,
+.cutout-card header button:hover {
+  border-color: var(--input-focus);
+}
+
+/* Outline editor */
+
+.toolbar-btn {
+  background: var(--input-bg);
+  border: 1px solid var(--input-border);
+  border-radius: var(--radius);
+  color: var(--text);
+  font: inherit;
+  font-size: 11px;
+  padding: 3px 10px;
+  cursor: pointer;
+}
+
+.toolbar-btn.active {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.outline-hint {
+  position: absolute;
+  top: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: calc(100% - 32px);
+  background: rgba(0,0,0,0.75);
+  border: 1px solid #444;
+  border-radius: var(--radius);
+  padding: 4px 10px;
+  font-size: 11px;
+  color: #ddd;
+  text-align: center;
+  pointer-events: none;
+}
+
 /* Charts */
 
 .chart-panel {
@@ -486,6 +597,42 @@ select:focus {
 
 #status-text.done {
   color: var(--accent-green);
+}
+
+/* Result no longer matches the settings. */
+.canvas-wrap.stale canvas {
+  opacity: 0.45;
+  transition: opacity 0.15s;
+}
+
+#status-text.stale {
+  color: #e0a030;
+}
+
+.solve-btn {
+  background: var(--accent);
+  border: none;
+  border-radius: var(--radius);
+  color: #fff;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 4px 14px;
+  cursor: pointer;
+}
+
+.solve-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* Out-of-date result: draw attention to Solve. */
+.solve-btn.stale {
+  box-shadow: 0 0 0 2px rgba(10,132,255,0.35);
+}
+
+.auto-solve input {
+  accent-color: var(--accent);
 }
 
 #status-text.error {

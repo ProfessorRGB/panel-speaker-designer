@@ -1,6 +1,6 @@
 # Flat Panel Speakers: Physics, Topology & Tools
 
-*From violin bass bars to finite element analysis — a self-contained lesson.*
+*From violin bass bars to finite element analysis — a self-contained lesson, and the reasoning behind Panel Speaker Designer.*
 
 ---
 
@@ -30,7 +30,7 @@ Flat panel speakers — developed commercially under the NXT/DML banner in the l
 
 Every resonant mode of a panel has a characteristic shape — regions that move a lot (antinodes) and lines where movement is zero (node lines). If you place your exciter on a node line of a given mode, that mode doesn't get driven at all. It's absent from the output.
 
-Center placement on a rectangular panel is nearly the worst possible choice: it sits on the symmetry axes, which means it can't excite any antisymmetric mode — roughly half of all available modes. **Almost any informed placement beats center placement.** This is the low bar your first software only needs to clear.
+Center placement on a rectangular panel is nearly the worst possible choice. A rectangle's modes fall into four symmetry families: symmetric or antisymmetric about the vertical centre line, and symmetric or antisymmetric about the horizontal one. Every mode that is antisymmetric about a centre line has a node line along it. So anywhere on one centre line misses about half the modes, and the centre — on both lines — misses about three quarters. **Almost any informed placement beats center placement.** In Panel Speaker Designer's heat map this shows up as a dark cross along both centre lines.
 
 ```
 BAD: center placement          BETTER: offset placement       OPTIMAL: scored placement
@@ -42,73 +42,106 @@ BAD: center placement          BETTER: offset placement       OPTIMAL: scored pl
 │      │      │                │      │  ●   │                │╌╌╌╌╌│╌╌╌╌╌╌│
 │      │      │                │      │      │                │  ╌╌╌│╌╌╌╌╌ │
 └─────────────┘                └─────────────┘                └─────────────┘
-Center sits on node            Offset avoids (1,1)            Scored to avoid
-lines of (1,1) mode            node lines                     multiple modes
+Center sits on both            Offset avoids the              Scored to avoid
+centre-line node lines         centre lines                   many modes' node lines
 ```
 
 ### The Role of Panel Material
 
-Bending wave speed in a panel depends on stiffness, density, and frequency. The dispersion relation — how wave speed varies with frequency — determines where modes fall. For an **isotropic** material (same properties in all directions), this is a single clean equation. For **anisotropic** materials (wood, some composites), bending wave speed differs along each axis, and the mode structure becomes directionally asymmetric.
+Bending wave speed in a panel depends on stiffness, density, and frequency. The dispersion relation — how wave speed varies with frequency — determines where modes fall. For an **isotropic** material (same properties in all directions), this is a single clean equation. For **orthotropic** materials (wood, plywood, many composites), bending stiffness differs along each axis, and the mode structure becomes directionally asymmetric.
+
+This matters more than it sounds. Balsa is roughly 30× stiffer along the grain than across it, so a balsa panel's modes look nothing like an acrylic panel's of the same size. Panel Speaker Designer takes stiffness along the width (`E_x`), along the height (`E_y`) and in shear (`G`, which governs twisting modes); for wood, put the grain along the width.
 
 ---
 
-## 03 — Level One Software: What You Can Calculate Analytically
+## 03 — Level One: What You Can Calculate Analytically
 
-For a rectangular, isotropic, free-edge panel, the mode shapes and frequencies are known analytically. You don't need simulation — you need arithmetic. This is the right place to start.
+For a rectangular panel, the modes can be calculated without a mesh. This is the right place to start, and it's where this project started.
 
-### What the Code Does
+### The Simple Model (and Why It Isn't Enough)
 
-Given panel dimensions (width, height, thickness) and material constants (Young's modulus, density, Poisson's ratio), you can calculate: the frequency of each mode; the node line pattern of each mode; and a score for any candidate exciter position based on how close it sits to node lines across all modes.
-
-**Key libraries:** NumPy (array math, mode frequencies), SciPy (eigenvalue solvers for boundary variations), Matplotlib (node line and score visualisation).
+The first version of the software used the textbook shortcut: treat each free-edge mode as `cos(mπx/Lx)·cos(nπy/Ly)` and give it the frequency of a simply-supported plate.
 
 ```python
-# Simplified plate mode frequency — isotropic free plate
-# f_mn depends on mode indices m, n and material/geometry constants
+# Simplified sketch of the original model. Easy to write, but see below.
 
 import numpy as np
 
 def mode_frequency(m, n, Lx, Ly, h, E, rho, nu):
-    # Bending stiffness D
-    D = (E * h**3) / (12 * (1 - nu**2))
-    # Approximate frequency for free rectangular plate
-    kx = (m * np.pi) / Lx
-    ky = (n * np.pi) / Ly
-    omega = np.sqrt(D / rho / h) * (kx**2 + ky**2)
-    return omega / (2 * np.pi)  # Hz
+    D = (E * h**3) / (12 * (1 - nu**2))          # bending stiffness
+    kx, ky = m * np.pi / Lx, n * np.pi / Ly
+    omega = np.sqrt(D / (rho * h)) * (kx**2 + ky**2)
+    return omega / (2 * np.pi)                    # Hz
 
 def score_position(x, y, Lx, Ly, modes):
-    # Score how well a position couples to each mode
-    # Higher score = drives more modes = better placement
-    score = 0
-    for m, n in modes:
-        amplitude = np.abs(
-            np.cos(m * np.pi * x / Lx) *
-            np.cos(n * np.pi * y / Ly)
-        )
-        score += amplitude
-    return score
+    # Higher score = position moves more in more modes
+    return sum(abs(np.cos(m * np.pi * x / Lx) * np.cos(n * np.pi * y / Ly))
+               for m, n in modes)
 ```
 
-A brute-force grid search over candidate positions, scored this way, gives you a heat map of good and bad placements. That's a genuinely useful result from maybe two hours of code.
+A brute-force grid search over positions gives a heat map, and that heat map already clears the "beat centre placement" bar. But the shortcut gets free edges wrong. A free edge is not where a cosine peaks; real free-edge mode shapes bend differently near the edges, and their frequencies come from different wavenumbers (a free-free beam's first bending mode uses about 1.506π/L, not 2π/L). On a 300 × 200 × 3 mm acrylic panel, the shortcut puts the first two modes at 87 and 107 Hz; the correct values are 52 and 57 Hz. For balsa, where the shortcut also ignores the grain, it is off by 4–10×.
 
-### What It Can't Tell You
+### What the App Does Instead
 
-This tier doesn't predict actual SPL response, radiation efficiency, or how the panel sounds at a specific listening position. It tells you where *not* to put the exciter, which is already valuable. Actual acoustic output you measure — simulation at this level is for placement strategy, not final prediction.
+**Rayleigh-Ritz.** The panel's bending and kinetic energies are written out in full (including the grain-dependent stiffnesses) and minimised over a family of smooth trial shapes (Legendre polynomials). The result is the true free-edge modes, matching Leissa's published values for a free square plate to within 0.5%. Simply-supported edges have an exact closed form, which the app uses directly.
+
+**The exciter isn't a point.** An exciter drives the panel around its voice-coil ring (typically 20–30 mm across), so its coupling to a mode is the mode's motion averaged around that ring. Modes smaller than the coil partly cancel themselves out, which a point model can't see.
+
+**Edges are excluded.** Free edges move more than anywhere else on a panel, and they're impractical mounting points, so the search ignores a margin of 10% of the shorter side.
 
 ---
 
-## 04 — Advanced Physics: Topology as Acoustic Engineering
+## 04 — Scoring Placement: Response Flatness
 
-Once you move beyond a simple homogeneous rectangle, the interesting design space opens up. Two tools are available: **stiffeners** (adding material) and **cutouts** (removing it). Both modify the path bending waves take across the panel — but they work differently.
+Counting how much a position moves in each mode was the first scoring rule. It has a blind spot: every mode counts the same, so a position that drives ten crowded modes around 2 kHz but leaves a hole at 300 Hz can still score well. What a listener hears is the *response* — how strongly the panel vibrates at each frequency.
+
+### From Modes to a Response
+
+Drive the panel with a steady force at one point and each mode responds like a damped resonator: strongly near its own frequency, weakly elsewhere, with the peak width set by the material's damping (the loss factor η). The panel's total vibration at any frequency is the sum of all those contributions, each weighted by how well the exciter couples to that mode. Averaged over the panel, the cross terms between modes cancel, which leaves a clean sum the app can evaluate for every position on the heat map at once.
+
+### Raggedness
+
+That response always slopes downward overall — that's the panel's physics, not something placement can fix. What placement *does* control is the peaks and dips on top of the slope. So the app scores each position by **raggedness**: how far, in dB RMS, the response wanders from its own one-octave-smoothed trend. Lower is flatter.
+
+On the 300 × 200 × 3 mm acrylic panel, the best position measures ±2.9 dB; the centre measures ±4.3 dB. Click anywhere on the heat map to see that position's response next to the best one.
+
+### Modal Density and Gaps
+
+Below the first few hundred hertz, any panel has only a handful of modes, and no exciter position can fill the gaps between them. The app's *modes per ⅓ octave* chart shows where those gaps are. The default acrylic panel has two empty bands, at 63 and 80 Hz, between its first pair of modes and the next. Bigger, thinner or less stiff panels push the gaps lower.
+
+### What This Still Can't Tell You
+
+The response here is how much the panel *vibrates*, not how loud it sounds at a listening position. Turning vibration into sound pressure needs radiation efficiency, which depends on frequency, panel size and baffling. This tier tells you how evenly a position drives the panel — very useful for placement and design comparisons — but measured output is the final word.
+
+---
+
+## 05 — Topology as Acoustic Engineering
+
+Once you move beyond a plain rectangle, the interesting design space opens up. Two tools are available: **stiffeners** (adding material) and **cutouts** (removing it). Both modify the path bending waves take across the panel — but they work differently.
 
 ### Stiffeners
 
-A stiffener — a rib, bar, or bonded strip — raises local bending stiffness along its axis. Bending waves traveling parallel to the stiffener propagate faster in that region. Waves crossing the stiffener encounter a stiffness discontinuity that reflects and scatters energy. The net effect is to redistribute mode frequencies and, crucially, to engineer anisotropy into an otherwise isotropic panel — exactly what the violin's bass bar does to spruce.
+A stiffener — a rib, bar, or bonded strip — raises bending stiffness along its axis. Bending waves traveling parallel to the stiffener propagate faster in that region. Waves crossing the stiffener encounter a stiffness discontinuity that reflects and scatters energy. The net effect is to redistribute mode frequencies and, crucially, to engineer anisotropy into an otherwise isotropic panel — exactly what the violin's bass bar does to spruce.
+
+In the app, on a 300 × 200 × 3 mm panel:
+
+- A spruce bar (5 × 8 mm) along the width of an **acrylic** panel raises the first bending mode along the bar from 56 Hz to 100 Hz. The twisting mode barely moves (52 → 53 Hz), because a thin bar adds little resistance to twist.
+- Three spruce ribs across the grain of a **balsa** panel raise its weak cross-grain mode from 64 Hz to 155 Hz — the bass-bar principle used to correct a material's weak direction. The panel then has fewer modes below 5 kHz (92 instead of 108), a trade-off worth watching in the modal-density chart.
 
 ### Cutouts
 
 A cutout doesn't just remove mass — it *severs a wave propagation path*. A slot forces bending waves to detour around the cut ends, increasing effective path length. Longer paths mean lower effective wave speed in that direction, shifting modes downward and creating directional asymmetry. A panel with parallel slots becomes strongly anisotropic: waves traveling along the slots propagate freely; waves crossing them must detour significantly.
+
+On the same acrylic panel:
+
+| Panel | 1st mode | 2nd mode | Modes below 5 kHz |
+|---|---|---|---|
+| Plain | 52 Hz | 56 Hz | 115 |
+| 40 mm round hole | 51 Hz | 55 Hz | 117 |
+| One slot across the middle | 46 Hz | 51 Hz | 120 |
+| Three parallel slots | 42 Hz | 50 Hz | 126 |
+
+A round hole barely matters. Slots lower the modes that bend across them and pack in more modes — more modal density is exactly what a DML panel wants.
 
 > **The slotted panel interpreted:** A rectangular panel with internal slots creates a series of coupled resonating fingers — like a marimba where the bars are still joined at both ends. Each finger has its own resonant character, but couples energy with its neighbors. The panel preferentially radiates energy along the slot axis, biasing the modal density directionally. This is engineered anisotropy from topology alone — no exotic materials required.
 
@@ -122,60 +155,74 @@ The same principle applies at small scale: a tuning fork's resonant frequency ca
 
 ---
 
-## 05 — Advanced Software: When You Need Finite Element Analysis
+## 06 — When You Need Finite Element Analysis
 
-Once the geometry is non-rectangular, the material is anisotropic, or stiffeners and cutouts are involved, the analytical solutions break down. The mode shapes no longer have closed-form expressions and you need numerical methods — finite element analysis (FEA).
+Once the outline isn't a rectangle, or there are cutouts or stiffeners, there are no closed-form mode shapes. You need numerical methods — finite element analysis (FEA).
 
 ### What FEA Actually Does
 
-FEA divides your panel into many small elements, each described by simple local equations. It assembles these into a global system and solves for the mode shapes and frequencies of the whole structure simultaneously — an eigenvalue problem. For a thin plate, the relevant FEA formulation uses shell or plate elements specifically designed for bending behavior.
+FEA divides the panel into many small elements, each described by simple local equations. It assembles these into a global system and solves for the mode shapes and frequencies of the whole structure at once — an eigenvalue problem.
 
-### The Full Pipeline
+### How Panel Speaker Designer Does It
+
+The whole pipeline runs inside the app, in Rust:
 
 ```
-Geometry Input
-(SVG / CAD / STEP / DXF)
+Outline (built-in shape or your Bézier curves) + holes + slots + rib lines
         │
-Geometry Processing
-(svgpathtools / CadQuery / pythonOCC → boundary representation)
+Mesh: constrained Delaunay triangulation, refined to a quality mesh
         │
-Mesh Generation
-(Gmsh Python API → triangulated mesh of panel surface)
+Elements: DKT thin-plate triangles (with grain-dependent stiffness),
+          plus beam elements along each rib
         │
-FEA Eigenvalue Solve
-(FEniCSx or SfePy → mode frequencies + shapes)
+Eigen-solve: sparse factorisation + block Lanczos → modes up to your max frequency
         │
-Analysis & Output
-(node line visualisation, exciter scoring, modal density plots)
+Same scoring as before: heat map, response, node lines
 ```
 
-### Choosing a Library
+The mesh is sized from the frequency range — about five elements per half-wavelength at the top of the band — which gives about 1–2% frequency error there and much less for the low modes. The solver was checked against the analytic rectangle solver (both isotropic acrylic and grain-heavy balsa), the exact simply-supported solution, and Leissa's values for a free circular plate, including the matched pairs of modes a circle has.
 
-| Library | Best For | Learning Curve |
-|---|---|---|
-| `FEniCSx` | Research-grade, arbitrary physics, well-documented plate formulations | Steep — requires comfort with weak form PDEs |
-| `SfePy` | More approachable, good shell/plate element support, Python-native | Moderate |
-| `Gmsh` | Meshing only — the keystone between geometry and FEA solver | Low for basic use |
-| `Calculix` | Full solver, Abaqus-like capability, open source | High — traditional solver workflow |
+Plain rectangles still use the faster analytic solver. Everything else takes about a second per solve, which is why the app has a **Solve** button rather than recalculating on every keystroke.
 
 ### Stiffeners in FEA
 
-Adding a bass-bar-style stiffener in FEA is modeled as a line of elements with different (higher) stiffness properties — or as beam elements superimposed on the plate mesh. This is where the perturbation approach breaks down and FEA earns its keep: the stiffness discontinuity along the bar creates mode shape changes that can't be approximated analytically.
+A rib is modelled as a beam running along mesh edges, bending along its length and twisting, with its mass added to the panel. Because it's glued to one face, a rib bends together with a strip of the panel as a T-shaped section — much stiffer than the bar alone. The app uses the standard engineering approximation for how wide that strip is (the rib width plus ten panel thicknesses either side). Real composite action depends on the panel's in-plane stiffness, which a thin-plate model doesn't include, so treat rib results as good for comparing designs and confirm with measurement.
+
+### Going Further in Python
+
+If you want to explore beyond the app — anisotropic composites with arbitrary layups, thick plates, or coupled acoustics — the Python ecosystem has the tools: Gmsh for meshing, and FEniCSx or SfePy for general-purpose FEA. They're far more flexible and far more work.
 
 ### What FEA Still Can't Tell You
 
-FEA gives you structural modes — how the panel vibrates. It doesn't directly give you acoustic output (SPL vs. frequency at a listening point). For that you need acoustic FEA or boundary element methods, which are significantly more complex. In practice: use structural FEA to optimize the panel, then *measure* the acoustic result. Simulation guides the design; measurement validates it.
+FEA gives you structural modes — how the panel vibrates. It doesn't directly give you acoustic output (SPL vs. frequency at a listening point). For that you need acoustic modelling — for a flat panel in a baffle, the Rayleigh integral is a tractable next step. In practice: use structural analysis to design the panel, then *measure* the acoustic result. Simulation guides the design; measurement validates it.
 
 ---
 
-## 06 — Roadmap: The Sensible Order of Operations
+## 07 — Measurement and Calibration
 
-| Phase | Goal | Tools | Output |
-|---|---|---|---|
-| 1 — Analytical | Beat center placement on a rectangle | NumPy, Matplotlib | Position heat map, mode frequency list |
-| 2 — Modal density | Check spectral coverage, find gaps | SciPy, NumPy | Modes-per-octave plot, coverage score |
-| 3 — Simple FEA | Handle non-rectangular shapes | Gmsh + SfePy | Mode shapes for arbitrary geometry |
-| 4 — Full FEA | Model stiffeners, cutouts, anisotropy | Gmsh + FEniCSx | Topology-aware mode optimisation |
-| 5 — Measure | Validate against reality | REW, microphone, exciter | Waterfall plots, actual frequency response |
+Simulation is only as good as its material constants, and those are the weak link. Foam and balsa stiffness can vary by ±50% from one sheet to the next, so a precise model fed a textbook value gives a precise wrong answer. Two measurements close the loop.
 
-> Phase 1 is an afternoon. Phase 3 is a weekend. Phase 4 is a project. Phase 5 is where you find out what you missed. Start at 1 — it already tells you something real.
+### Tap Test: Calibrate the Material
+
+Hang the bare panel from two threads (that's a free edge), tap it lightly, and record the sound with a phone or measurement mic. The spectrum shows sharp peaks at the panel's lowest modes. Their *pattern* is set by the shape; their *absolute frequencies* are set by stiffness and density. Weigh the panel for density, and the measured peaks pin down the stiffness of your actual sheet.
+
+### Frequency Response: Validate the Design
+
+Once a panel is built, measure its frequency response with a measurement mic and REW (Room EQ Wizard, free). Where measurement and prediction agree, trust the model; where they don't, the gap points to what's missing — damping, mounting, the exciter's own mass.
+
+Neither is in the app yet (roadmap phase C, below), but the tap test is worth doing on any sheet before you trust the numbers.
+
+---
+
+## 08 — Roadmap: The Sensible Order of Operations
+
+| Phase | Goal | Status in the app |
+|---|---|---|
+| 1 — Analytical placement | Beat centre placement on a rectangle | **Done** |
+| A — Accurate modes | True free-edge modes, wood grain, exciter size | **Done** |
+| B — Response scoring | Score placement by response flatness; show modal density and gaps | **Done** |
+| D — Geometry (FEA) | Any outline, cutouts, stiffeners, custom Bézier shapes | **Done** |
+| C — Calibration | Fit stiffness to tap-test peaks; overlay REW measurements | Waiting on a physical panel |
+| E — Radiation | Estimate sound pressure from a baffled panel (Rayleigh integral) | Optional |
+
+> Phase 1 is an afternoon. FEA is a project. Measurement is where you find out what you missed. Start with a plain rectangle — it already tells you something real.
