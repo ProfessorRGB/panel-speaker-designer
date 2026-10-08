@@ -14,11 +14,24 @@ npx tsc --noEmit
 # Check Rust without building the full binary
 cd src-tauri && cargo check
 
-# Build release bundle (.app)
-npm run tauri build
+# Run the Rust tests (use --release: the FEA tests are slow in debug)
+cd src-tauri && cargo test --release --lib
+
+# Lint Rust
+cd src-tauri && cargo clippy --lib
+
+# Build release bundle (.app) → src-tauri/target/release/bundle/macos/
+npm run tauri build -- --bundles app
+
+# Faster debug .app (reuses the dev build)
+npm run tauri build -- --debug --bundles app
 ```
 
 Hot-reload applies to frontend changes (HTML/CSS/TS) automatically. Rust changes trigger a recompile and window reload via Tauri's file watcher.
+
+The dev profile builds dependencies at `opt-level = 3` and the crate at `opt-level = 1` (see `Cargo.toml`), so `tauri dev` runs the solvers at usable speed; the first build after a clone takes a couple of minutes. If a release build fails reading a path from an old project location, delete `src-tauri/target/release` (stale build-script output).
+
+The frontend can be exercised in a plain browser (`npm run dev`, port 1420) by stubbing `window.__TAURI_INTERNALS__.invoke` with recorded solver output; the native window isn't needed to test UI logic.
 
 ## Architecture
 
@@ -27,9 +40,14 @@ This is a **Tauri 2.0** app: a Rust backend exposed as IPC commands, a Vite/Type
 ### Data flow
 
 ```
-User input (HTML inputs) → getParams() → invoke("compute_heatmap") → Rust
-    → CalculationResult (grid[], modes[], optimal_x/y) → render() on <canvas>
+Sidebar inputs + cutout/rib cards + outline editor
+    → Solve → getParams() → invoke("compute_heatmap") → Rust
+        → CalculationResult (grid, region, outline, modes, optimum, response) → render(), charts
+Mode overlay   → invoke("mode_shape")  → node lines
+Click on panel → invoke("response_at") → comparison curve
 ```
+
+All three commands reuse the cached solve for the same `PanelParams`, so overlays and clicks are cheap after a Solve.
 
 Calculation runs when the user presses **Solve** (or Enter in any sidebar field). Edits only mark the result stale (`scheduleCalculate` → `markStale`, faded heat map); with the **Auto** checkbox on, edits solve after a 400 ms pause. Live solving on every keystroke used to send half-typed values (e.g. a 4 mm width while typing "450") that the FEA solver choked on. `editVersion` keeps edits made during a solve marked stale. Resize re-renders without recalculating.
 
@@ -39,7 +57,7 @@ Calculation runs when the user presses **Solve** (or Enter in any sidebar field)
 - `compute_heatmap(params) -> CalculationResult` — heat map, mode list, optimal position
 - `mode_shape(params, index, n) -> Vec<f64>` — one mode sampled on an n×n grid, for the node-line overlay
 - `response_at(params, x, y) -> ResponseCurve` — response (dB per band) and raggedness at a clicked position
-- Both run off the main thread (`#[tauri::command(async)]`) and share the last eigen-solve through a static cache keyed on `SolveKey`
+- All three run off the main thread (`#[tauri::command(async)]`) and share the last solve through a static `CACHE` keyed on `ModelKey` (the lock is held during a solve, so a slow solve delays later requests — one reason for the Solve button)
 - **Coupling** to each mode = its shape averaged around the exciter's voice-coil ring (`exciter_d`; 0 = point drive)
 - **Placement score** (`params.score`): `"flatness"` (default) = raggedness of the damped response, lower is better; `"coupling"` = sum of |coupling| over modes ≤ `freq_max` (the v0.1 score). `grid` is normalised so 1 = best; `grid_raw` keeps the score's units
 - The solve is sized for `1.3 × freq_max` (`RESPONSE_HEADROOM`) so the response near `freq_max` includes the tails of modes just above it
@@ -79,7 +97,7 @@ Calculation runs when the user presses **Solve** (or Enter in any sidebar field)
 
 ### Frontend — `src/main.ts`
 
-All state is module-level. Key globals: `lastResult`, `selectedModeIdx`, `selectedShape`, `requestId` (drops stale async results).
+All state is module-level. Key globals: `lastResult` / `lastParams` (the solved result and the params it used — overlays and clicks use `lastParams`, not the current inputs), `selectedModeIdx`, `selectedShape`, `probe`, `cutouts`, `stiffeners` (sidebar state, mm), `editor` (outline editor), `requestId` (drops stale async results), `editVersion` (stale tracking).
 
 - `getParams()` reads inputs and converts units (mm→m, MPa→Pa)
 - "Isotropic" checkbox derives `E_y = E_x` and `G = E/2(1+ν)`; presets with `ey`/`g` set are orthotropic
@@ -94,3 +112,7 @@ All state is module-level. Key globals: `lastResult`, `selectedModeIdx`, `select
 ### Roadmap
 
 Done: Phase 1; A (accurate free-edge modes, orthotropy, exciter footprint); B (response-flatness scoring, response and modal-density charts); D1 (FEA engine, built-in shapes), D2 (holes and slots), D3 (straight stiffeners), D4 (custom Bézier outlines). Remaining: C — calibrate stiffness from tap-test frequencies and overlay REW measurements (needs a physical panel); E (optional) — Rayleigh-integral SPL estimate. See README.
+
+### Documentation
+
+`README.md` (usage, physics summary, limits) and `docs/panel-speaker-lesson.md` (a self-contained lesson on the physics, with the app's own numbers as examples) describe user-visible behaviour. When a feature or a default changes, update both — the lesson quotes specific results (e.g. mode frequencies for the default 300 × 200 × 3 mm acrylic panel) that should be re-checked if the solvers change.
