@@ -14,6 +14,10 @@ The app calculates the panel's vibration modes, predicts how the panel responds 
 
 Panels can be rectangles, rounded rectangles, ellipses, regular polygons or outlines you draw yourself with Bézier curves, with holes, slots and glued-on stiffening ribs.
 
+![Panel Speaker Designer: placement heat map of a 300 × 200 × 3 mm acrylic panel, with the response at the best position compared against the panel centre, and modes per ⅓ octave](docs/screenshot.png)
+
+*The default 300 × 200 × 3 mm acrylic panel. The crosshair marks the best exciter position; the orange ring is a clicked position at the centre, which sits on both centre-line node lines. Their responses are compared below (±2.9 dB vs ±4.3 dB raggedness), next to the modes per ⅓ octave.*
+
 ---
 
 ## Using it
